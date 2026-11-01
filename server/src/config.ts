@@ -25,6 +25,7 @@ import {
 } from "./dictation/config";
 import type { BrokerProvider } from "./plugins/access";
 import { type VoiceConfig, voiceConfig } from "./voice/config";
+import { type VaultConfig, vaultConfig } from "./vault/config";
 import { type WebBotAuth, webBotAuthFromEnv } from "./web-bot-auth";
 
 export type RuntimeCapabilities = {
@@ -422,6 +423,7 @@ export type DeploymentConfig = {
    * door for them standing open.
    */
   workerSharedSecret?: string;
+  vault?: VaultConfig;
 };
 
 type Environment = Record<string, string | undefined>;
@@ -1481,6 +1483,10 @@ export function loadConfig(
       ? { agentToolToken: optional(environment, "AGENT_TOOL_TOKEN") as string }
       : {}),
     ...(workerSharedSecret ? { workerSharedSecret } : {}),
+    ...(() => {
+      const vault = vaultConfig(environment);
+      return vault ? { vault } : {};
+    })(),
   };
 }
 

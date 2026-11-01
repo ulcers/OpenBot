@@ -36,6 +36,9 @@ import {
   recordAuditEvent,
 } from "./audit";
 import { createDevRequireUser } from "./auth/dev-actor";
+import { createVaultClient } from "./vault/client";
+import { createSshKeyService } from "./vault/ssh-keys";
+import { createVaultSshKeyRoutes } from "./vault/routes";
 import {
   type AppVariables,
   type AuthService,
@@ -1297,6 +1300,19 @@ export function createApp(
       }
     },
   );
+  if (config.vault) {
+    const vaultClient = createVaultClient({
+      address: config.vault.address,
+      token: config.vault.token,
+      namespace: config.vault.namespace,
+    });
+    const sshKeyService = createSshKeyService(vaultClient, config.vault);
+    app.route(
+      "/api/admin/vault/ssh-keys",
+      createVaultSshKeyRoutes(sshKeyService, requireUser),
+    );
+  }
+
   app.get("/api/admin/package", requireUser, async (context) => {
     const denied = requireAdmin(context);
     if (denied) return denied;
