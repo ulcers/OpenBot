@@ -3,6 +3,10 @@ import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { createAuditStore, recordAuditEvent } from "../../audit";
 import type { Database } from "../../db/client";
 import {
+  type EntraRefusal,
+  EntraTokenRefusedError,
+} from "../../auth/entra-refusal";
+import {
   type CredentialExecutor,
   CredentialUnusableError,
   decryptCredentialForUse,
@@ -48,6 +52,7 @@ import {
   INVALID_GRANT,
   isUsableClient,
   type OAuthClient,
+  OAuthClientReadError,
   PluginInvariantError,
   type PluginKind,
   PluginRefusedError,
@@ -56,6 +61,26 @@ import {
   TokenRefusedError,
   type Transaction,
 } from "./model";
+
+/** What a person is told when Entra will not issue a token for them, in words they can act on. */
+function entraRefusal(reason: EntraRefusal, title: string): string {
+  switch (reason) {
+    case "not-admitted":
+      return `You no longer have access to OpenBot, so ${title} wasn't used.`;
+    case "no-sign-in":
+      return `${title} uses your Microsoft account, and OpenBot doesn't have your Microsoft sign-in. Sign in to OpenBot with Microsoft in the browser once, then ask again.`;
+    case "sign-in-expired":
+      return `Your Microsoft sign-in has expired, so ${title} wasn't used. Sign in with Microsoft again and ask again.`;
+    case "no-consent":
+      return `An admin hasn't given OpenBot access to ${title} in Microsoft Entra. Ask an admin to grant it.`;
+    case "no-api-consent":
+      return `OpenBot doesn't have consent for its own API in Microsoft Entra, so it can't reach ${title} as you. Ask an admin to grant it.`;
+    case "no-api":
+      return `OpenBot isn't set up in Microsoft Entra to reach ${title} as you. Ask an admin to expose OpenBot's API there.`;
+    case "refused":
+      return `Microsoft wouldn't let OpenBot reach ${title} as you. Try again, or ask an admin if it keeps happening.`;
+  }
+}
 
 /**
  * What every group of plugin store methods shares: the options it was made with, and the helpers
@@ -488,12 +513,20 @@ export function createStoreContext(options: PluginStoreOptions) {
    * complete by construction rather than by cleanup. The other two paths have nothing to cache: a
    * `deployment-token` is decrypted out of the vault per call, and a `brokered` key is never held
    * here at all.
+   *
+   * A `person-entra` server is the exception, by design: the token Entra issues for a person is kept
+   * in memory until a few minutes before it expires (`auth/entra.ts`), because Entra's own guidance
+   * is to reuse a token for its lifetime. Removing the person here still stops it at once: every
+   * token is handed out only after the sign-in rules are asked again, and a refusal drops what is
+   * held for them.
    */
   async function connectionTokenFor(
     row: {
       id: string;
       title: string;
       credentialId: string | null;
+      /** The Entra scope a `person-entra` server is reached with; see `mcpServers.entraScope`. */
+      entraScope?: string | null;
       /*
        * NO `authScheme` HERE, DELIBERATELY. The scheme that decides whether a brokered call needs a
        * connection row is the APP'S, read through `brokeredAppScheme` below — and this row's own
@@ -729,6 +762,38 @@ export function createStoreContext(options: PluginStoreOptions) {
        * DEPLOYMENT_ID unable to move the account a call lands in.
        */
       return { vendorUserId: connected.vendorUserId };
+    }
+
+    /*
+     * A server reached as the signed-in person through Microsoft: a token Entra issues for the
+     * person asking, from their own Microsoft sign-in, for this server's scope. Never the
+     * deployment's credential, for the reason the `person-oauth` branch below gives, so every way it
+     * cannot be theirs is a refusal naming what they or an admin can do about it.
+     */
+    if (access.credential === "person-entra") {
+      if (!actorId) {
+        throw new PluginRefusedError(
+          `${row.title} answers as the person asking, and this run is not attributed to anybody.`,
+          null,
+        );
+      }
+      if (!options.entra || !row.entraScope) {
+        throw new PluginRefusedError(
+          `${row.title} needs Microsoft sign-in, and it isn't set up. Ask an admin to set it up.`,
+          null,
+        );
+      }
+      try {
+        return { token: await options.entra.tokenFor(actorId, row.entraScope) };
+      } catch (error) {
+        if (error instanceof EntraTokenRefusedError) {
+          throw new PluginRefusedError(
+            entraRefusal(error.reason, row.title),
+            null,
+          );
+        }
+        throw error;
+      }
     }
 
     if (access.credential !== "person-oauth") {
@@ -1297,6 +1362,40 @@ export function createStoreContext(options: PluginStoreOptions) {
   });
 
   /**
+   * Classify only client reads, never vendor registration or subsequent vault writes.
+   *
+   * The fault is logged by its name alone, because a vault or decryption message can quote the stored
+   * value. The error thrown in its place carries nothing of it, so this line is all an operator gets.
+   */
+  async function readClient(
+    serverId: string,
+    work: () => Promise<OAuthClient | null>,
+  ): Promise<OAuthClient | null> {
+    try {
+      return await work();
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: "mcp-oauth-client-read-failed",
+          server: serverId,
+          error: error instanceof Error ? error.name : "UnknownError",
+        }),
+      );
+      throw new OAuthClientReadError();
+    }
+  }
+
+  /** Parse errors can quote plaintext, so an invalid client is never rethrown with its secret. */
+  function clientFromStoredJson(plaintext: string): OAuthClient | null {
+    try {
+      const parsed: unknown = JSON.parse(plaintext);
+      return isUsableClient(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * One writer at a time for one server's OAuth client, across the whole deployment.
    *
    * Everything that stores a client reads "is there a live one" and then writes accordingly, and the
@@ -1341,35 +1440,29 @@ export function createStoreContext(options: PluginStoreOptions) {
     transaction: Transaction,
     serverId: string,
   ): Promise<OAuthClient | null> {
-    const [server] = await transaction
-      .select({ credentialId: mcpServers.credentialId })
-      .from(mcpServers)
-      .where(eq(mcpServers.id, serverId))
-      .limit(1);
-    if (!server?.credentialId) return null;
+    return readClient(serverId, async () => {
+      const [server] = await transaction
+        .select({ credentialId: mcpServers.credentialId })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, serverId))
+        .limit(1);
+      if (!server?.credentialId) return null;
 
-    const [held] = await transaction
-      .select({
-        encryptedValue: credentialRows.encryptedValue,
-        revokedAt: credentialRows.revokedAt,
-      })
-      .from(credentialRows)
-      .where(eq(credentialRows.id, server.credentialId))
-      .limit(1);
-    if (!held || held.revokedAt) return null;
+      const [held] = await transaction
+        .select({
+          encryptedValue: credentialRows.encryptedValue,
+          revokedAt: credentialRows.revokedAt,
+        })
+        .from(credentialRows)
+        .where(eq(credentialRows.id, server.credentialId))
+        .limit(1);
+      if (!held || held.revokedAt) return null;
 
-    try {
-      const parsed: unknown = JSON.parse(
-        await decryptSecret(encryptionKey, held.encryptedValue),
-      );
-      // A value that parsed and is not a client is unreadable in the same way and for the same
-      // caller — see {@link isUsableClient}. Null, because that is what this reader's caller acts
-      // on: it goes and registers one, which is the answer to holding none.
-      return isUsableClient(parsed) ? parsed : null;
-    } catch {
-      // Unreadable is the same as none: there is nothing to send anybody to consent with.
-      return null;
-    }
+      // A decryption fault does not mean the vendor forgot this client. Re-registering would replace
+      // the live client for every replica, including those that can still decrypt it.
+      const plaintext = await decryptSecret(encryptionKey, held.encryptedValue);
+      return clientFromStoredJson(plaintext);
+    });
   }
 
   /**
@@ -1490,29 +1583,29 @@ export function createStoreContext(options: PluginStoreOptions) {
   async function storedOAuthClient(
     serverId: string,
   ): Promise<OAuthClient | null> {
-    const [row] = await database
-      .select({ credentialId: mcpServers.credentialId })
-      .from(mcpServers)
-      .where(eq(mcpServers.id, serverId))
-      .limit(1);
-    if (!row?.credentialId) return null;
+    return readClient(serverId, async () => {
+      const [row] = await database
+        .select({ credentialId: mcpServers.credentialId })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, serverId))
+        .limit(1);
+      if (!row?.credentialId) return null;
 
-    try {
-      const parsed: unknown = JSON.parse(
-        await decryptCredentialForUse(
+      let plaintext: string;
+      try {
+        plaintext = await decryptCredentialForUse(
           encryptionKey,
           credentials,
           row.credentialId,
-        ),
-      );
-      // A client that parsed and is not one is as unusable as the revoked or missing row the catch
-      // below answers for, and is the same none to every caller — see {@link isUsableClient}.
-      return isUsableClient(parsed) ? parsed : null;
-    } catch {
-      // A revoked, missing or unreadable client is the same as none for every caller: there is
-      // nothing to send anybody to consent with, and the answer is to obtain one again.
-      return null;
-    }
+        );
+      } catch (error) {
+        // Only a confirmed missing or revoked credential permits obtaining a replacement. A failed
+        // read or decryption must not turn a working deployment-wide registration into a new client.
+        if (error instanceof CredentialUnusableError) return null;
+        throw error;
+      }
+      return clientFromStoredJson(plaintext);
+    });
   }
 
   /**

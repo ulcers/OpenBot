@@ -148,6 +148,13 @@ export const mcpServers = pgTable(
      * this column writes rows without it.
      */
     ownerGrants: text("owner_grants").$type<"any" | "admin">(),
+    /**
+     * The Microsoft Entra scope a server added by URL is reached with as the signed-in person, for
+     * example `api://hr-api/.default`. Set, each call goes out with a token Entra issues for that
+     * person through the on-behalf-of exchange (`auth/entra.ts`); null, the server is reached on the
+     * one credential the deployment holds for it, as every server added by URL always was.
+     */
+    entraScope: text("entra_scope"),
     /** What the deployment last heard back from it. `null` until the first successful listing. */
     toolsRefreshedAt: timestamp("tools_refreshed_at", { withTimezone: true }),
     /** The last failure, kept so the Plugins page can say why a server has no tools. */
@@ -264,6 +271,19 @@ export const mcpTools = pgTable(
      * an approver to click through the colour.
      */
     destructive: boolean("destructive").notNull().default(false),
+    /**
+     * Whether the server marked this action read-only (MCP `readOnlyHint`), as it said it.
+     *
+     * Its own fact, and NOT an input to {@link mcpTools.effect}: chat goes on deciding whether to ask
+     * first exactly as it did, because a hint from a server nobody reviewed is not believed there.
+     * A check-in reads it, and only for an app the person connected with their own account, where
+     * the tool's own read-only label is what decides whether a background run may call it. See
+     * `labelledRead` in `plugins/catalogue.ts`.
+     *
+     * `false` for an action nothing said about, and for rows listed before this column existed: an
+     * app is re-read on its next refresh.
+     */
+    declaredRead: boolean("declared_read").notNull().default(false),
     /**
      * The vendor's version for this action, as the listing gave it — `20260903_00` and the like.
      *
