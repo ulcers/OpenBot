@@ -31,7 +31,10 @@ import {
   useState,
 } from "react";
 import { Streamdown } from "streamdown";
-import { ArgumentsArrivingContext } from "@/components/gallery/streaming";
+import {
+  ArgumentsArrivingContext,
+  TurnInFlightContext,
+} from "@/components/gallery/streaming";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import {
   Dialog,
@@ -72,6 +75,7 @@ import {
 } from "@/lib/plugins/tool-result";
 import { readTeamBotConsent } from "@/lib/team-bots";
 import { cn } from "@/lib/utils";
+import { useResultVisibility } from "@/lib/product-telemetry";
 import { VOICE_CHAT_ACTIVITY, type VoiceChatEntry } from "@/lib/voice/archive";
 import { AppAccessCard } from "./app-access-card";
 import { isBrowserStep } from "./browser-activity";
@@ -108,6 +112,8 @@ import {
 import { VoiceChatCard } from "./voice-chat-card";
 
 type ChatTranscriptProps = {
+  /** Server-owned thread identity, used only to correlate rendered result messages. */
+  threadId?: string;
   busy?: boolean;
   /** Comma-separated `/` command names, used to tell a skill chip from a leading slash. */
   commandNames?: string;
@@ -715,12 +721,18 @@ const TranscriptMessage = memo(function TranscriptMessage({
   commandNames = "",
   role,
   streaming = false,
+  settled = true,
   text,
+  threadId,
+  messageId,
 }: {
   commandNames?: string;
   role: "user" | "assistant";
+  threadId?: string;
+  messageId: string;
   /* This is the Bot's reply still being written: the last row of a turn in flight. */
   streaming?: boolean;
+  settled?: boolean;
   text: string;
 }) {
   const isUser = role === "user";
@@ -736,6 +748,10 @@ const TranscriptMessage = memo(function TranscriptMessage({
    * chip split, the end alignment and the bubble are all wrong for it, and each one of them would
    * have to learn about firings separately if this branched any later.
    */
+  const resultRef = useResultVisibility(
+    threadId ? { threadId, messageId } : undefined,
+    !isUser && settled && revealed.trim().length > 0,
+  );
   const firing = isUser ? readFiring(text) : null;
   if (firing !== null) {
     return (
@@ -808,13 +824,15 @@ const TranscriptMessage = memo(function TranscriptMessage({
                  * closing token arrives, so the answer visibly rewrites itself as it lands. This
                  * closes them for the duration.
                  */
-                <Streamdown
-                  components={markdownComponents}
-                  mode={mode}
-                  plugins={markdownPlugins}
-                >
-                  {revealed}
-                </Streamdown>
+                <div ref={resultRef}>
+                  <Streamdown
+                    components={markdownComponents}
+                    mode={mode}
+                    plugins={markdownPlugins}
+                  >
+                    {revealed}
+                  </Streamdown>
+                </div>
               )}
             </BubbleContent>
           </Bubble>
@@ -1487,6 +1505,8 @@ type ToolRowProps = {
   id: string;
   steps: ToolGroup["steps"];
   active: boolean;
+  /** The row's turn is still running. See `TurnInFlightContext`. */
+  inFlight: boolean;
   latest: boolean;
   /** The Bot said something after this row in its turn. See `ToolPlace`. */
   spokeAfter: boolean;
@@ -1503,6 +1523,7 @@ export function sameToolRow(a: ToolRowProps, b: ToolRowProps): boolean {
   return (
     a.id === b.id &&
     a.active === b.active &&
+    a.inFlight === b.inFlight &&
     a.latest === b.latest &&
     a.spokeAfter === b.spokeAfter &&
     a.steps.length === b.steps.length &&
@@ -1523,27 +1544,30 @@ const ToolRow = memo(function ToolRow({
   id,
   steps,
   active,
+  inFlight,
   latest,
   spokeAfter,
 }: ToolRowProps) {
   const [only] = steps;
   return (
-    <Arriving>
-      {steps.length === 1 && only && !isBrowserStep(only) ? (
-        <ArgumentsArrivingContext.Provider value={active}>
-          <ToolCallBody
-            args={only.toolCall.function.arguments}
-            latest={latest}
-            name={only.toolCall.function.name}
-            result={only.result}
-            spokeAfter={spokeAfter}
-            toolCallId={only.toolCall.id}
-          />
-        </ArgumentsArrivingContext.Provider>
-      ) : (
-        <ToolActivity active={active} group={{ kind: "tools", id, steps }} />
-      )}
-    </Arriving>
+    <TurnInFlightContext.Provider value={inFlight}>
+      <Arriving>
+        {steps.length === 1 && only && !isBrowserStep(only) ? (
+          <ArgumentsArrivingContext.Provider value={active}>
+            <ToolCallBody
+              args={only.toolCall.function.arguments}
+              latest={latest}
+              name={only.toolCall.function.name}
+              result={only.result}
+              spokeAfter={spokeAfter}
+              toolCallId={only.toolCall.id}
+            />
+          </ArgumentsArrivingContext.Provider>
+        ) : (
+          <ToolActivity active={active} group={{ kind: "tools", id, steps }} />
+        )}
+      </Arriving>
+    </TurnInFlightContext.Provider>
   );
 }, sameToolRow);
 
@@ -1823,6 +1847,7 @@ function TranscriptRenderersWatch({
 }
 
 export function ChatTranscript({
+  threadId,
   busy = false,
   commandNames = "",
   intro,
@@ -1911,6 +1936,13 @@ export function ChatTranscript({
 
   /* Which tool calls are still the latest thing, for an app card: see `latestFrom`. */
   const latestIndex = latestFrom(items, { busy, queued: queued.length });
+  /* Where the turn in flight starts: every row from here on is still running while the Bot works. */
+  const turnStart =
+    items.findLastIndex(
+      (item) =>
+        (item.kind === "text" && item.role === "user") ||
+        item.kind === "attachments",
+    ) + 1;
   /* The last thing the Bot said, so a call can tell whether its turn went on to say anything: see `ToolPlace`. */
   const lastBotWords = items.findLastIndex(
     (item) => item.kind === "text" && item.role === "assistant",
@@ -2158,6 +2190,7 @@ export function ChatTranscript({
         <ToolRow
           active={busy && index === items.length - 1}
           id={item.id}
+          inFlight={busy && index >= turnStart}
           latest={index >= latestIndex}
           spokeAfter={lastBotWords > index}
           steps={item.kind === "tools" ? item.steps : [item]}
@@ -2179,6 +2212,9 @@ export function ChatTranscript({
         {...openingProps(item.id)}
       >
         <TranscriptMessage
+          threadId={threadId}
+          messageId={item.id}
+          settled={!busy || index < turnStart}
           commandNames={commandNames}
           role={item.role}
           streaming={
