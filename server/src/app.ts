@@ -66,6 +66,10 @@ import {
 } from "./channels/attachments";
 import type { ChannelEventHub } from "./channels/events";
 import { createGroupRoutes, type GroupConversations } from "./channels/group";
+import {
+  createModelChoiceRoutes,
+  type ModelChoices,
+} from "./channels/model-choice";
 import { type ChannelStore, createChannelRoutes } from "./channels/routes";
 import type { ThreadIdentity } from "./channels/thread-identity";
 import { createThreadRoutes } from "./channels/thread-routes";
@@ -93,11 +97,13 @@ import {
 import { mountDesktopConnectionFailure } from "./desktop-connection-failure";
 import { createTranscriptionProvider } from "./dictation/provider";
 import { createDictationRoutes } from "./dictation/routes";
+import { createEditionGate } from "./edition-routes";
 import type { HostAccessBroker } from "./host-access/broker";
 import { createHostAccessRoutes } from "./host-access/routes";
 import { identityRoutes } from "./identity/routes";
 import type { IdentityStore } from "./identity/store";
 import { createIntelligenceClient } from "./intelligence-client";
+import { createCapturePassOrigin } from "./intelligence-gateway-proxy";
 import {
   createLearningRoutes,
   type LearningAdminDependencies,
@@ -109,6 +115,10 @@ import {
 import type { MemoryIngestion } from "./memory/ingestion";
 import { createMemoryRoutes } from "./memory/routes";
 import type { MemoryStore } from "./memory/store";
+import {
+  createModelRoutes,
+  type ModelCatalogueReader,
+} from "./model-catalogue";
 import { parsePageLimit } from "./paging";
 import { createPasswordRoutes, createSignInRoutes } from "./passwords/routes";
 import type { SignInService } from "./passwords/service";
@@ -130,16 +140,18 @@ import { REFUSAL_MARKER, vendorAnswer } from "./plugins/tools";
 import type { ProactiveEngine } from "./proactive/engine";
 import { createProactiveRoutes } from "./proactive/routes";
 import type { ProactiveStore } from "./proactive/store";
-import { createTaskRoutes } from "./tasks/routes";
-import type { TaskRunner } from "./tasks/runner";
-import type { TaskStore } from "./tasks/store";
 import {
   type ModelProviderProxy,
   mountProviderOAuthProxy,
 } from "./provider-oauth";
-import { createRequireRecorder } from "./recorder/guard";
+import {
+  createRequireRecorder,
+  RECORDER_BEARER_PREFIX,
+} from "./recorder/guard";
 import { createRecorderRoutes } from "./recorder/routes";
 import type { RecorderExtensionDeps } from "./recorder/wiring";
+import { createReleaseStatusRoutes } from "./release-status";
+import { createOriginGuard, createSingleUserGate } from "./request-trust";
 import type { ResponsibilityBindingStore } from "./responsibilities/bindings";
 import type { ResponsibilityEngine } from "./responsibilities/engine";
 import { createGithubResponsibilityRoutes } from "./responsibilities/github";
@@ -151,11 +163,15 @@ import type { RoutineRunner } from "./routines/runner";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
 import { createCoworkerRoutingService } from "./routing/service";
-import type { ProductTelemetry } from "./telemetry/product";
-import { createProductTelemetryRoutes } from "./telemetry/product-routes";
 import type { SelfHostBanner } from "./self-host-banner";
+import { createSetupRoutes, type SetupSources } from "./setup/checklist";
+import { createTaskRoutes } from "./tasks/routes";
+import type { TaskRunner } from "./tasks/runner";
+import type { TaskStore } from "./tasks/store";
 import { createTeamBotRoutes } from "./team-bots/routes";
 import type { TeamBots } from "./team-bots/team-bots";
+import type { ProductTelemetry } from "./telemetry/product";
+import { createProductTelemetryRoutes } from "./telemetry/product-routes";
 import type { PackageStatusReader } from "./tenant-package";
 import {
   INSTRUCTIONS_LIMIT,
@@ -475,6 +491,15 @@ export function createApp(
     teamBots?: TeamBots;
     /** Pause, reset, Activity and attention for a person's own Bots. See agents/lifecycle.ts. */
     lifecycle?: BotLifecycleServices;
+    /**
+     * The setup checklist Settings → Setup draws, read from this server's own
+     * configuration and state. See setup/checklist.ts. Absent, `/api/setup` is not mounted.
+     */
+    setup?: SetupSources;
+    /** The models a person may pick for a built-in Bot's run. Absent, `/api/models` is not mounted. */
+    models?: ModelCatalogueReader;
+    /** Each person's pick per conversation. Absent, `/api/channels/:id/model` is not mounted. */
+    modelChoices?: ModelChoices;
   },
   /**
    * Whether to offer help self-hosting, which also hides it from a deployment that pays for
@@ -489,10 +514,14 @@ export function createApp(
   profileStore?: ProfileStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
+  // First, in every auth mode: a page from another website changes nothing here and opens no socket.
+  // See request-trust.ts for what passes and why.
+  app.use("/api/*", createOriginGuard(config));
   mountDesktopConnectionFailure(app, desktopHostToken);
   mountProviderOAuthProxy(app, modelProviderProxy);
 
   app.get("/health", (context) => context.json({ status: "ok" }));
+  app.route("/", createReleaseStatusRoutes());
   // The public key Bots' browsers sign their requests with, where Cloudflare and any other verifier
   // look for it. Public by design, and absent when Web Bot Auth is off. See web-bot-auth.ts.
   const webBotAuth = config.webBotAuth;
@@ -520,9 +549,13 @@ export function createApp(
       generativeUi: config.generativeUi,
       // Whether to offer help self-hosting OpenBot. A fork running it for its own people turns it off,
       // and a deployment that pays for Intelligence never sees it. See self-host-banner.ts.
-      selfHostBanner: selfHostBanner
-        ? await selfHostBanner.shown()
-        : config.selfHostBanner,
+      // Never in the personal edition: one person running it for themselves is not the audience.
+      selfHostBanner:
+        config.edition === "personal"
+          ? false
+          : selfHostBanner
+            ? await selfHostBanner.shown()
+            : config.selfHostBanner,
       /*
        * Whether this is somebody trying OpenBot on their own machine, not an organization's
        * deployment. Onboarding reads it to explain where OpenBot can run, which only the person
@@ -533,6 +566,8 @@ export function createApp(
        * a local trial, and an operator cannot forget to set it.
        */
       localEvaluation: config.singleUser,
+      // Which product this is: the app shows the personal edition's screens instead of Admin.
+      edition: config.edition,
       transcription: Boolean(config.transcription),
       voice: Boolean(config.voice),
       /*
@@ -562,6 +597,8 @@ export function createApp(
         enterpriseControls()?.snapshot()?.settings.ssoRequired === true,
     }),
   );
+  // Ahead of every route it closes, the auth handler's SSO and SCIM routes included.
+  app.use("/api/*", createEditionGate(config.edition));
   /*
    * Registering an identity provider is an administrator's decision, not a signed-in one.
    *
@@ -660,9 +697,10 @@ export function createApp(
   }> = async (context) =>
     context.json({ error: "No identity provider is configured." }, 503);
   // One administrator, when nothing is configured to sign anybody in. Checked first, and only ever
-  // true when there is no provider, so a configured deployment cannot fall back to it.
+  // true when there is no provider, so a configured deployment cannot fall back to it. Admitted only
+  // from where that one person can be: see `singleUserRefusal`.
   const requireUser = config.singleUser
-    ? createDevRequireUser()
+    ? createDevRequireUser(config.singleUserAccess)
     : auth && roleRepository
       ? createRequireUser(auth, roleRepository)
       : authenticationUnavailable;
@@ -1419,6 +1457,30 @@ export function createApp(
   // The CopilotKit runtime, behind the same session guard as every other API route. Mounted last so
   // its own routing under /api/copilotkit cannot shadow an OpenBot route declared above.
   if (copilotHandler) {
+    /*
+     * The runtime admits the single-user administrator by itself (`resolveRequestActor`), from a
+     * request its hooks may already have copied, so the connection it came on is checked here, in
+     * front of it. A Recorder bearer is not the administrator: it resolves to its own connection and
+     * is refused everywhere but the capture pass.
+     */
+    if (config.singleUser)
+      app.use(
+        "/api/copilotkit/*",
+        createSingleUserGate(config.singleUserAccess, (request) =>
+          Boolean(
+            request.headers
+              .get("authorization")
+              ?.startsWith(RECORDER_BEARER_PREFIX),
+          ),
+        ),
+      );
+    /*
+     * The Recorder's capture pass names the Intelligence gateway's socket, and where this server
+     * carries that socket with no public URL to write before it, as over a `kubectl port-forward`, the
+     * address is a path. The page resolves a path against itself; the Recorder is not on the page, so
+     * its pass is answered knowing this server's own origin as the Recorder reached it.
+     */
+    app.use("/api/copilotkit/*", createCapturePassOrigin(config));
     // Mounted at the ROOT with the handler carrying its own basePath. Mounting it at
     // "/api/copilotkit" as well double-prefixes it: Hono strips the prefix before the handler sees
     // the path, so every route lands at /api/copilotkit/api/copilotkit/* and /info 404s. The browser
@@ -1555,6 +1617,12 @@ export function createApp(
             store: agentProfileStore,
             router: intentRouter,
             auditStore,
+            skillsFor: pluginStore
+              ? async (agentId) =>
+                  (await pluginStore.listForAgent(agentId)).skills.map(
+                    (skill) => skill.slug,
+                  )
+              : undefined,
             /*
              * Which vendors each coworker holds tools for, so the router weighs what a coworker can
              * reach and not only what somebody wrote it was for. Only when there is a plugin store to
@@ -1705,6 +1773,20 @@ export function createApp(
     app.route(
       "/api/bots",
       createBotLifecycleRoutes(coworker.lifecycle, requireUser),
+    );
+  /*
+   * Signed in, unlike `/api/capabilities`, which anybody can read. The checklist names what this
+   * deployment has and lacks, and for an admin which variables would close a gap, which is not a
+   * visitor's to have before they sign in.
+   */
+  if (coworker?.setup)
+    app.route("/api/setup", createSetupRoutes(coworker.setup, requireUser));
+  if (coworker?.models)
+    app.route("/api/models", createModelRoutes(coworker.models, requireUser));
+  if (coworker?.modelChoices)
+    app.route(
+      "/api/channels",
+      createModelChoiceRoutes(coworker.modelChoices, requireUser),
     );
   if (coworker?.groups)
     app.route("/api/groups", createGroupRoutes(coworker.groups, requireUser));
@@ -1961,6 +2043,8 @@ export function createApp(
           // From the assertion, never the body: this is the name the audit row will carry.
           actorId: verdict.actorId,
           ...(verdict.initiator ? { initiator: verdict.initiator } : {}),
+          // The conversation this run is in, signed with the rest: where a routine asked for "here" posts.
+          ...(verdict.run.threadId ? { threadId: verdict.run.threadId } : {}),
         });
         // Worded by the helper the in-process door uses, so a framework Bot's model reads a vendor's
         // error as the vendor's and not as a result. Neither Bot words it on its way through.
@@ -2046,8 +2130,9 @@ export function createApp(
   /*
    * The built app, served by the API that serves it.
    *
-   * WHY THE SAME PROCESS. There is no CORS anywhere in this server, deliberately, so the app has to
-   * reach `/api` on its own origin. Two containers behind one ingress does that too, and costs a
+   * WHY THE SAME PROCESS. The app's API calls get no CORS from this server, deliberately, so the app
+   * has to reach `/api` on its own origin. (The runtime answers CORS for this deployment's own origins
+   * and the Recorder only; see `cors` in copilot.ts.) Two containers behind one ingress does that too, and costs a
    * path rule on every deployment plus a way for the two to disagree about which host they are on.
    * One process cannot disagree with itself.
    *

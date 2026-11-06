@@ -17,8 +17,6 @@ WORKDIR /app
 
 # Manifests before sources, so a source change does not reinstall the world.
 COPY package.json bun.lock ./
-# The dependency patches package.json names in patchedDependencies: the install stops without them.
-COPY patches patches
 # The shared tsconfig, which every package extends. Vite reads it while transforming and fails
 # without it, in a stack trace that names esbuild rather than a missing file.
 COPY tsconfig.base.json tsconfig.base.json
@@ -90,6 +88,23 @@ ENV APP_DIST_DIR=/app/app/dist
 
 USER openbot:openbot
 
+# Public release identity is baked into the final image, independently of installation sidecars.
+ARG OPENBOT_BUILD_VERSION
+ARG OPENBOT_BUILD_COMMIT
+ARG OPENBOT_BUILD_DISTRIBUTION_ID
+ARG OPENBOT_BUILD_REPOSITORY
+ARG OPENBOT_BUILD_CHANNEL
+ENV OPENBOT_BUILD_VERSION=${OPENBOT_BUILD_VERSION} \
+    OPENBOT_BUILD_COMMIT=${OPENBOT_BUILD_COMMIT} \
+    OPENBOT_BUILD_DISTRIBUTION_ID=${OPENBOT_BUILD_DISTRIBUTION_ID} \
+    OPENBOT_BUILD_REPOSITORY=${OPENBOT_BUILD_REPOSITORY} \
+    OPENBOT_BUILD_CHANNEL=${OPENBOT_BUILD_CHANNEL}
+
+# Where this server runs, said by the image so no deployment has to. On a single-user OpenBot outside a
+# container only callers on this machine are the administrator; in here every caller arrives through
+# the container engine's network, so that rule would refuse everybody. See `singleUserAccess` in
+# server/src/config.ts.
+ENV OPENBOT_IN_CONTAINER=true
 ENV NODE_ENV=production
 ENV PORT=3001
 EXPOSE 3001

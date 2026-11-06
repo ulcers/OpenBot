@@ -174,6 +174,11 @@ export class PlanModel implements PlanLanguageModel {
     input: Pick<RunAgentInput, "threadId">,
     frontendTools: ReadonlySet<string> = new Set(),
     signal?: AbortSignal,
+    /**
+     * The model and effort from the plan's own listing, picked by the person or the middle of the
+     * plan's line. Absent: the harness falls back to a model its plan offers.
+     */
+    private readonly choice?: { model: string; reasoningEffort?: string },
   ) {
     this.provider = `openbot-${config.provider}-plan`;
     this.modelId = config.provider;
@@ -253,7 +258,9 @@ export class PlanModel implements PlanLanguageModel {
     this.streaming = true;
     this.pendingTools = [];
     const messages = planMessages(options.prompt);
-    const tools = (options.tools ?? []).map((tool) => {
+    const answerOnly = options.toolChoice?.type === "none";
+    // The plan harnesses consume AG-UI tools, not the AI SDK's toolChoice. Omit the tools too.
+    const tools = (answerOnly ? [] : (options.tools ?? [])).map((tool) => {
       if (tool.type !== "function")
         throw new Error(
           "Built-in plan Bots only support caller-owned function tools.",
@@ -313,6 +320,9 @@ export class PlanModel implements PlanLanguageModel {
             forwardedProps: {
               openbotModelOnly: true,
               openbotBotId: this.botId,
+              ...(this.choice ? { openbotModel: this.choice } : {}),
+              // Claude must replace its still-running SDK query to change the tools it holds.
+              ...(answerOnly ? { openbotAnswerOnly: true } : {}),
             },
           })
           .subscribe({

@@ -13,8 +13,6 @@ FROM oven/bun:1.4.3@sha256:ec06c3b6cea04192ae6770c434f668ca41d343ad19fa6472216c7
 FROM bun-toolchain AS recorder-build
 WORKDIR /src
 COPY package.json bun.lock ./
-# The dependency patches package.json names in patchedDependencies: the install stops without them.
-COPY patches patches
 COPY tsconfig.base.json bunfig.toml ./
 COPY app/package.json app/package.json
 COPY server/package.json server/package.json
@@ -71,6 +69,12 @@ RUN ln -s /app/node_modules /shared/node_modules
 # still serves Bots and refuses to open a person's browser, saying why.
 COPY --from=recorder-build /src/extension/dist /recorder
 ENV OPENBOT_RECORDER_DIR=/recorder
+
+# The X server's socket directory and the keysym names its keyboard data needs, as the root Dockerfile
+# has them: Xvfb as any user but root refuses to make the first, and xkbcomp warns at every start
+# without the second. See docker/x11/XKeysymDB.
+RUN install -d -m 1777 /tmp/.X11-unix
+COPY docker/x11/XKeysymDB /usr/share/X11/XKeysymDB
 
 # Durable working directory. Bot-produced files that must survive replacement live here.
 RUN mkdir -p /workspace

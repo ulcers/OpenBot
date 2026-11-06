@@ -6,13 +6,22 @@ import {
   useAgent,
   useCopilotKit,
 } from "@copilotkit/react-core/v2";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BotOrb } from "@/components/agents/bot-orb";
+import {
+  answerMessage,
+  QuestionNotice,
+  shownAnswer,
+  useConversationQuestion,
+} from "@/components/approvals/question-notice";
 import { ChannelWorkRows } from "@/components/channels/channel-work";
 import { attachmentModality } from "@/components/channels/chat-messages";
 import { toAgentOptions } from "@/components/channels/composer";
+import { ModelPicker } from "@/components/channels/composer/model-picker";
 import { ConversationIntro } from "@/components/channels/conversation-intro";
 import { ConversationView } from "@/components/channels/conversation-view";
+import { ProgressRow } from "@/components/channels/progress-row";
 import {
   seedMessage,
   takeFirstMessage,
@@ -21,6 +30,7 @@ import {
 import { VoiceCallWidget } from "@/components/channels/voice-call-widget";
 import { HandoffResumeNotice } from "@/components/computer/handoff-resume-notice";
 import { agentListQueryOptions } from "@/lib/agents/queries";
+import { answerPersonQuestionMutationOptions } from "@/lib/approvals";
 import { attachmentUrl } from "@/lib/channels/attachments";
 import {
   recordChannelActivityMutationOptions,
@@ -35,15 +45,28 @@ import {
   onTurnFinishedAway,
   turnFinishedAway,
 } from "@/lib/channels/turns-finished-away";
-import { useActiveBot } from "@/lib/copilot/active-bot";
-import { observeApprovalAgent } from "@/lib/copilot/approval-context";
+import { useConversationActivity } from "@/lib/computers/activity";
+import { channelAgentId, useActiveBot } from "@/lib/copilot/active-bot";
+import {
+  observeApprovalAgent,
+  whileObserved,
+} from "@/lib/copilot/approval-context";
+import { offerItsOwnTools } from "@/lib/copilot/bot-offer";
 import { ConversationProvider } from "@/lib/copilot/conversation";
 import { afterMs, joinWithin } from "@/lib/copilot/join-thread";
 import { repairUnansweredToolCalls } from "@/lib/copilot/repair-history";
 import { releaseServerOwnedInterrupts } from "@/lib/copilot/server-owned-interrupts";
-import { stoppedReason } from "@/lib/copilot/stopped-turn";
-import { readThreadMessages } from "@/lib/copilot/thread-messages";
-import { useSkillCommands } from "@/lib/plugins/skill-commands";
+import { followLastRun, stoppedReason } from "@/lib/copilot/stopped-turn";
+import {
+  readThreadMessages,
+  withCurrentA2uiVersions,
+} from "@/lib/copilot/thread-messages";
+import { modelCatalogueQueryOptions } from "@/lib/models/queries";
+import { useConversationModel } from "@/lib/models/run-model";
+import {
+  skillInstructionsFor,
+  useSkillCommands,
+} from "@/lib/plugins/skill-commands";
 import {
   askChannelAgent,
   messageText,
@@ -334,9 +357,9 @@ export function ChannelChat({
   const botProfile = agentProfiles?.find(
     (profile) => profile.id === runtimeAgentId,
   );
-  const channelAgentId = `channel:${channel.id}`;
+  const localAgentId = channelAgentId(channel.id);
   const { agent, isReady } = useAgent({
-    agentId: channelAgentId,
+    agentId: localAgentId,
     runtimeAgentId,
     threadId: channel.threadId,
     updates: [
@@ -344,20 +367,39 @@ export function ChannelChat({
       UseAgentUpdate.OnRunStatusChanged,
     ],
   });
-  useEffect(() => observeApprovalAgent(agent), [agent]);
+  /*
+   * FOR THE AGENT'S TURNS, NOT THE SCREEN'S. A turn goes on after the person leaves this
+   * conversation, and a step a rule asks about is still sent to the gate with this conversation,
+   * which needs the run's input captured. Leaving lets the observer go, and it stops once the last
+   * turn started here (`whileObserved`, below) is over. It used to stop on leaving, and a run that
+   * started after that went to the gate under the previous run's id.
+   *
+   * And the agent is given its own Bot's offer as it is made, so its runs, here or after the person
+   * has left, are offered this Bot's tools and never the screen's (`bot-offer.ts`).
+   */
+  const queries = useQueryClient();
+  useEffect(() => {
+    offerItsOwnTools(agent, runtimeAgentId, queries);
+    return observeApprovalAgent(agent);
+  }, [agent, runtimeAgentId, queries]);
 
   /**
    * First-message seed from the compose screen. It is taken once per mount and retained until the
    * agent has its own messages because joining a fresh thread can temporarily empty the agent.
    */
-  const [seed] = useState<Message | null>(() => {
+  const [first] = useState(() => {
     const pending = takeFirstMessage(channel.id);
-    return pending ? seedMessage(pending, newId()) : null;
+    return pending
+      ? {
+          seed: seedMessage(pending.text, newId()),
+          skillInstructions: pending.skillInstructions,
+        }
+      : null;
   });
+  const seed = first?.seed ?? null;
 
   /** Cleared by the send-on-mount effect without restarting it. */
-  const seedRef = useRef(seed);
-  seedRef.current = seed;
+  const seedRef = useRef(first);
 
   /** Promise gate for ordering the first message after the thread join when possible. */
   const openJoinGate = useRef<() => void>(() => {});
@@ -412,6 +454,14 @@ export function ChannelChat({
     "ready" | "unavailable"
   >("ready");
   const [historyReadFailed, setHistoryReadFailed] = useState(false);
+  /**
+   * Why the last run ended without an answer, drawn under the transcript.
+   *
+   * Set by a turn of this mount that fails, and on joining the thread when the history it replays
+   * ends in a failed run (`followLastRun`), so the failure is still there after a reload. Cleared by
+   * the next turn.
+   */
+  const [runError, setRunError] = useState<string | null>(null);
   // Mount reads and Bot refreshes share one ordering: only the newest read owns the notice.
   const historyReadVersion = useRef(0);
   useEffect(() => {
@@ -423,12 +473,18 @@ export function ChannelChat({
     if (!isReady) return;
     let current = true;
     const version = ++historyReadVersion.current;
+    // Before the connect: it is handed the subscribers the agent has when it starts.
+    const lastRun = followLastRun(agent);
 
     void (async () => {
+      let joined: "connected" | "deadline" = "deadline";
       try {
         // Bounded, and finished when it returns; `join-thread.ts` has why that matters.
-        await joinWithin({
-          connect: copilotkit.connectAgent({ agent }),
+        joined = await joinWithin({
+          // A turn too: restoring a thread can run the calls it left unanswered.
+          connect: whileObserved(agent, () =>
+            copilotkit.connectAgent({ agent }),
+          ),
           deadline: afterMs(JOIN_DEADLINE_MS),
           detach: () => agent.detachActiveRun(),
         });
@@ -438,6 +494,17 @@ export function ChannelChat({
          * typed afterwards waits on that gate, so a throw here would silence the conversation
          * rather than degrade it. History is restored below either way.
          */
+      } finally {
+        lastRun.stop();
+      }
+      /*
+       * The last run failed, so say so again, as the turn did when it failed. Only from a replay
+       * that finished: one ended at the deadline may stop short of the run that answered. Not over
+       * a turn already waiting to go, which clears it the moment it starts.
+       */
+      const failed = joined === "connected" ? lastRun.failure() : null;
+      if (failed !== null && current && turnsRef.current === 0) {
+        setRunError((shown) => shown ?? failed);
       }
 
       try {
@@ -449,7 +516,12 @@ export function ChannelChat({
         if (isCurrent) {
           // The gateway snapshot can lag the store. Keep its valid local rows even when the
           // corresponding stored row is unreadable, while restoring other readable additions.
-          const messages = mergeStoredMessages(agent.messages, stored.messages);
+          // The snapshot's interfaces are read in the A2UI version CopilotKit reads now, as the
+          // store's are (thread-messages.ts), or the local copy kept here would not draw.
+          const messages = mergeStoredMessages(
+            withCurrentA2uiVersions(agent.messages),
+            stored.messages,
+          );
           if (messages !== agent.messages) agent.setMessages(messages);
         }
         /*
@@ -555,7 +627,7 @@ export function ChannelChat({
           setHistoryReadFailed(false);
           const current = agentRef.current;
           const messages = mergeStoredMessages(
-            current.messages,
+            withCurrentA2uiVersions(current.messages),
             stored.messages,
           );
           if (messages === current.messages) continue;
@@ -597,8 +669,22 @@ export function ChannelChat({
 
   // Tool calls from this conversation act on this coworker's own computer.
   useActiveBot(runtimeAgentId);
+  // And what they did there is what the Activity pane beside its screen lists, whichever way they ran.
+  useConversationActivity(runtimeAgentId, agent.messages);
 
   const skillCommands = useSkillCommands(runtimeAgentId);
+  /*
+   * The model this conversation's Bot answers on. Only a Bot that runs inside OpenBot uses OpenBot's
+   * model, so only it gets a picker; a Bot on its own framework picks its own model.
+   */
+  const models = useQuery({
+    ...modelCatalogueQueryOptions(),
+    enabled: botProfile?.runsOnOpenBotModel === true,
+  });
+  const runModel = useConversationModel(
+    channel.id,
+    botProfile?.runsOnOpenBotModel ? models.data : undefined,
+  );
   /*
    * History is the snapshot, the stored thread AND the voice archive. The transcript shows none of
    * it until all three are in, so it lands once at the bottom instead of drawing the conversation
@@ -624,8 +710,6 @@ export function ChannelChat({
     unreadable,
   });
 
-  // Run failures arrive as events and are reported only for turns started in this mount.
-  const [runError, setRunError] = useState<string | null>(null);
   const awaitingReply = useRef(false);
   /**
    * WHY THIS TURN ENDED WITHOUT AN ANSWER, KEPT WHERE `deliver` CAN STILL SEE IT — because the one
@@ -846,7 +930,7 @@ export function ChannelChat({
     setRunsInFlight((count) => count + 1);
     try {
       await withVoiceContext(copilotkit, target.agentId, voiceHistory, () =>
-        copilotkit.runAgent({ agent: target }),
+        whileObserved(target, () => copilotkit.runAgent({ agent: target })),
       );
     } finally {
       watching.unsubscribe();
@@ -962,7 +1046,16 @@ export function ChannelChat({
       // both is not told two different things about the same silence.
       onRunErrorEvent: ({ event }) => fail(stoppedReason(event?.message)),
       onRunFailed: ({ error }) => fail(stoppedReason(error)),
-      onRunFinishedEvent: () => {
+      onRunFinishedEvent: ({ event }) => {
+        /*
+         * A run the server stopped to ask the person (an app's call OpenBot asks about) draws its
+         * card now, not on the inbox's next poll, as a computer step's does.
+         */
+        if (
+          (event as { outcome?: { type?: unknown } } | undefined)?.outcome
+            ?.type === "interrupt"
+        )
+          void queryClient.invalidateQueries({ queryKey: ["approvals"] });
         const wasOurs = awaitingReply.current;
         awaitingReply.current = false;
         /*
@@ -992,6 +1085,35 @@ export function ChannelChat({
   }, [agent, runtimeAgentId]);
 
   /** Stable reference for effects and component callbacks. */
+  /*
+   * A question the Bot is waiting on in this conversation. While there is one, what the person sends
+   * is their answer to it: it goes through the answer path, which resumes the turn that asked (a
+   * routine's, with the routine's tools) and closes the question, rather than starting a new turn
+   * that leaves it open. Their words are drawn at once under the id the server stores them under;
+   * the Bot's reply arrives as any turn run away from this tab does, through the history read above.
+   */
+  const question = useConversationQuestion(channel.id, channel.threadId);
+  const answer = useMutation(answerPersonQuestionMutationOptions(queryClient));
+  const [answeredId, setAnsweredId] = useState<string | null>(null);
+  const answerTo = async (text: string) => {
+    if (!question) return;
+    await answer.mutateAsync({ id: question.id, response: text });
+    const sent = answerMessage(question, text);
+    setAnsweredId(sent.id);
+    agent.setMessages([...agent.messages, sent]);
+  };
+  // Until a Bot message lands after the answer, the Bot is reading it.
+  const answeredAt = answeredId
+    ? agent.messages.findIndex((message) => message.id === answeredId)
+    : -1;
+  const readingAnswer =
+    answeredAt !== -1 &&
+    !agent.messages
+      .slice(answeredAt + 1)
+      .some((message) => message.role === "assistant");
+  const botName = botProfile?.name ?? channel.name;
+  const botSeed = botProfile?.avatarSeed || runtimeAgentId;
+
   const sayRef = useRef(say);
   sayRef.current = say;
   const stopEpoch = useRef(0);
@@ -1050,8 +1172,12 @@ export function ChannelChat({
     // Swallowed for the reason `askFromComponent` above records: `say` throws on a failed turn, and
     // the seed has no box to go back into — it was typed on a screen that has already navigated
     // away. The transcript keeps the seeded message and the notice under it says what happened.
+    // Its `/` skills go with it, so they arrive in front of it as they do for a message typed here.
     void sayRef
-      .current(typeof pending.content === "string" ? pending.content : "")
+      .current(
+        typeof pending.seed.content === "string" ? pending.seed.content : "",
+        pending.skillInstructions,
+      )
       .catch(() => undefined);
 
     // Keep `seed` in state; transcriptMessages gives it up once the agent holds a user turn.
@@ -1061,7 +1187,7 @@ export function ChannelChat({
     // Activity renderers resolve their agent through this SDK context. It must match useAgent's
     // channel instance so an action continues this thread instead of looking for a default agent.
     <CopilotChatConfigurationProvider
-      agentId={channelAgentId}
+      agentId={localAgentId}
       threadId={channel.threadId}
     >
       <ConversationProvider ask={askFromComponent}>
@@ -1079,6 +1205,8 @@ export function ChannelChat({
             taskRunning={agent.isRunning || runsInFlight > 0}
           />
           <ConversationView
+            // Remounted per conversation, so opening one puts the caret in its composer once.
+            autoFocus
             threadId={channel.threadId}
             voiceCall={
               call.available
@@ -1103,12 +1231,33 @@ export function ChannelChat({
             busy={agent.isRunning || turnsInFlight > 0}
             // The `/` menu exposes only skills granted to this Bot.
             commands={skillCommands}
+            modelPicker={
+              <ModelPicker
+                catalogue={
+                  botProfile?.runsOnOpenBotModel ? models.data : undefined
+                }
+                disabled={!channel.active}
+                onChange={runModel.choose}
+                saving={runModel.saving}
+                value={runModel.value}
+              />
+            }
             // Readiness is handled by `say`; deletion is the only disabled-chat state.
             disabled={!channel.active}
             messages={withVoiceChats(
-              transcriptMessages(agent.messages, seed),
+              transcriptMessages(agent.messages, seed).map(shownAnswer),
               voiceArchive.entries,
             )}
+            attached={
+              question && channel.active ? (
+                <QuestionNotice
+                  avatarSeed={botSeed}
+                  botName={botName}
+                  onAnswered={answerTo}
+                  question={question}
+                />
+              ) : undefined
+            }
             notice={
               /*
                * Two things can be worth saying at once — a deleted coworker and a history with holes in
@@ -1122,7 +1271,9 @@ export function ChannelChat({
                   run={async () => {
                     setRunsInFlight((count) => count + 1);
                     try {
-                      await copilotkit.runAgent({ agent });
+                      await whileObserved(agent, () =>
+                        copilotkit.runAgent({ agent }),
+                      );
                     } finally {
                       setRunsInFlight((count) => count - 1);
                     }
@@ -1149,6 +1300,11 @@ export function ChannelChat({
                     {historyNotice}
                   </p>
                 ) : null}
+                {answer.error ? (
+                  <p className="pb-2 text-sm text-destructive" role="alert">
+                    {answer.error.message}
+                  </p>
+                ) : null}
                 {channel.active ? null : (
                   <p
                     className="pb-2 text-sm text-muted-foreground"
@@ -1161,23 +1317,27 @@ export function ChannelChat({
               </>
             }
             onSubmit={async (draft) => {
+              await runModel.beforeSend();
               // `draft.agentId` carries the @mentioned coworker, but nothing routes on it yet: this
               // channel is pinned to one `runtimeAgentId` for the life of its thread, so honouring a
               // per-message mention is a change to that binding, not to the composer.
               //
               // `commandIds` are the `/` chips that survived into the send, in the order they were
-              // typed. Resolved against the same list the menu was built from, so a chip left over from
-              // a skill that has since been revoked resolves to nothing rather than to a stale
-              // instruction — the menu is refetched, and this reads from it.
-              const skillInstructions = draft.commandIds
-                .map(
-                  (id) =>
-                    skillCommands.find((command) => command.id === id)?.prompt,
-                )
-                .filter((instruction): instruction is string =>
-                  Boolean(instruction),
-                );
+              // typed; see `skillInstructionsFor`.
+              const skillInstructions = skillInstructionsFor(
+                draft.commandIds,
+                skillCommands,
+              );
 
+              // An answer is words only: a draft carrying files or a skill is sent as a turn.
+              if (
+                question &&
+                draft.attachments.length === 0 &&
+                skillInstructions.length === 0
+              ) {
+                await answerTo(draft.text);
+                return;
+              }
               await say(draft.text, skillInstructions, draft.attachments);
             }}
             /**
@@ -1226,12 +1386,20 @@ export function ChannelChat({
              */
             working={
               agent.isRunning || turnsInFlight > 0 ? null : (
-                <ChannelWorkRows
-                  botOf={(botId) =>
-                    agentProfiles?.find((profile) => profile.id === botId)
-                  }
-                  work={channel.work}
-                />
+                <>
+                  {readingAnswer ? (
+                    <ProgressRow
+                      label={`${botName} is reading your answer…`}
+                      media={<BotOrb name={botName} seed={botSeed} size={20} />}
+                    />
+                  ) : null}
+                  <ChannelWorkRows
+                    botOf={(botId) =>
+                      agentProfiles?.find((profile) => profile.id === botId)
+                    }
+                    work={channel.work}
+                  />
+                </>
               )
             }
           />

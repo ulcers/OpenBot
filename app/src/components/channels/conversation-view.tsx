@@ -8,7 +8,10 @@ import {
   useState,
 } from "react";
 import { useBotLook } from "@/components/agents/bot-look";
-import { ChatTranscript } from "@/components/channels/chat-transcript";
+import {
+  ChatTranscript,
+  skillLabels,
+} from "@/components/channels/chat-transcript";
 import {
   type AgentOption,
   type CommandOption,
@@ -19,6 +22,7 @@ import {
   type QueuedMessage,
   reduceQueue,
 } from "@/components/channels/composer";
+import { NotifyPrompt } from "@/components/notifications/notify-prompt";
 import { attachmentUrl } from "@/lib/channels/attachments";
 import { newId } from "../../lib/new-id";
 
@@ -27,6 +31,7 @@ export function ConversationView({
   threadId,
   busy = false,
   notice,
+  attached,
   agents = [],
   commands,
   channelId,
@@ -42,12 +47,18 @@ export function ConversationView({
   onSubmit,
   onStop,
   voiceCall,
+  modelPicker,
 }: {
   messages: readonly Message[];
   threadId?: string;
   busy?: boolean;
   /** Shown above the composer. An error, or why this conversation is read-only. */
   notice?: ReactNode;
+  /**
+   * A drawer on the composer's top edge, for what the next message answers: a little narrower than
+   * the composer, and tucked under it, so the two read as one control.
+   */
+  attached?: ReactNode;
   agents?: readonly AgentOption[];
   /**
    * The `/` menu for this Bot's granted skills, supplied by the route that owns grant loading.
@@ -106,6 +117,8 @@ export function ConversationView({
   /** Stop the Bot mid-answer; forwarded to turn the send button into a stop button. */
   onStop?: () => void;
   voiceCall?: { active: boolean; supported: boolean; onStart(): void };
+  /** The composer's model picker. See `Composer`. */
+  modelPicker?: ReactNode;
 }) {
   /*
    * THE QUEUE LIVES HERE BECAUSE BOTH HALVES OF IT DO.
@@ -426,19 +439,17 @@ export function ConversationView({
     <div className="flex flex-col flex-1 min-h-0">
       <div className="flex flex-1 min-h-0">
         {/*
-         * The command NAMES, joined, rather than the option objects.
+         * The commands and their names as one string, rather than the option objects.
          *
          * The transcript needs them only to tell a real skill chip from a message that happens to
-         * begin with a slash, and its message rows are memoised on primitives — handing them an
+         * begin with a slash, and to name it; its message rows are memoised on primitives — handing them an
          * array would give every message a new prop identity on each refetch and re-render the whole
          * conversation to change nothing.
          */}
         <ChatTranscript
           threadId={threadId}
           busy={busy}
-          commandNames={(commands ?? [])
-            .map((command) => command.name)
-            .join(",")}
+          commandLabels={skillLabels(commands ?? [])}
           {...(orbs && intro ? { intro } : {})}
           messages={messages}
           onRemoveQueued={(id) => {
@@ -451,16 +462,33 @@ export function ConversationView({
         />
       </div>
       <div
-        className="max-w-2xl mx-auto w-full px-0 pb-4 shrink-0"
+        className="max-w-3xl mx-auto w-full px-0 pb-4 shrink-0"
         data-slot="composer-column"
       >
         {notice}
+        {attached ? (
+          <div
+            className="mx-5 -mb-4 rounded-t-2xl border border-border border-b-0 bg-muted pb-4"
+            data-slot="composer-drawer"
+          >
+            {attached}
+          </div>
+        ) : null}
+        {/*
+         * Notifications are offered once this person has started a task: a Bot is working for them,
+         * so what a notification is for is plain. Read off the transcript, so the conversation a
+         * first message from home opens offers it too.
+         */}
+        {messages.some((message) => message.role === "user") ? (
+          <NotifyPrompt />
+        ) : null}
         <Composer
+          modelPicker={modelPicker}
           agents={agents}
           autoFocus={autoFocus}
           {...(channelId ? { channelId } : {})}
           {...(commands ? { commands } : {})}
-          className="w-full mt-auto"
+          className="relative w-full mt-auto"
           compact
           voiceCall={voiceCall}
           disabled={disabled}

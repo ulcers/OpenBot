@@ -103,6 +103,10 @@ function runLangGraphAguiModelProbe(
         "tools = ModuleType('src.tool_runtime')",
         "tools.ToolAwareAgent = LangGraphAgent",
         "tools.bind_tools = tools.execute_tools = tools.next_step = lambda *args: None",
+        "tools.billing_refusal = tools.provider_message = tools.provider_refusal = lambda *args, **kwargs: None",
+        "from types import SimpleNamespace",
+        // No run chose a model or effort, so the deployment's own configuration applies.
+        "tools.current_tools = lambda: SimpleNamespace(model='', effort='')",
         "tools.model_messages = lambda messages: messages",
         "sys.modules['src.tool_runtime'] = tools",
         "from src import main",
@@ -176,6 +180,17 @@ function runLangGraphAguiModelProbe(
     writeFileSync(
       join(dir, "langgraph", "checkpoint", "memory.py"),
       ["class MemorySaver:", "    pass", ""].join("\n"),
+    );
+    // The ChatGPT plan's model list (`chatgpt_models`) imports httpx at module level. The probe
+    // only builds a model, so a stand-in is enough, like the packages above.
+    writeFileSync(
+      join(dir, "httpx.py"),
+      [
+        "class AsyncClient:",
+        "    def __init__(self, *_args, **_kwargs):",
+        "        pass",
+        "",
+      ].join("\n"),
     );
 
     const env: NodeJS.ProcessEnv = {
@@ -446,7 +461,8 @@ test("passes the selected Anthropic provider and model into the picked harness",
     OPENAI_API_KEY: "sk-openai-synthetic",
     OPENAI_BASE_URL: "https://openai-compatible.example/v1",
     BOT_PROVIDER: "openai",
-    BOT_MODEL: "gpt-5.5",
+    // Unset arrives as unset: the server, not a stand-in here, decides the model.
+    BOT_MODEL: "",
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_BASE_URL: "",
   });
@@ -586,6 +602,22 @@ test("carries per-Bot egress into the computer and the supervisor", () => {
   expect(compose).toContain("required: false");
 });
 
+/**
+ * The personal edition's one computer is its one person's (scripts/start.sh sets `COMPUTER_PERSON_ID`), so Record runs
+ * in their Bots' browsers there. Anywhere else it is unset, and the shared computer stays nobody's.
+ */
+test("starts the shared computer as one person's only when told whose it is", () => {
+  expect(
+    runComposeConfig({ COMPUTER_PERSON_ID: "personal" }).services[
+      "agent-computer"
+    ]?.environment.COMPUTER_PERSON_ID,
+  ).toBe("personal");
+  expect(
+    runComposeConfig({}).services["agent-computer"]?.environment
+      .COMPUTER_PERSON_ID,
+  ).toBe("");
+});
+
 test("gives the selected harness the same governed callback as the framework Bot", () => {
   const config = runComposeConfig({
     OPENBOT_TOOL_URL: "http://callback.example/api/agent-tools/call",
@@ -598,6 +630,25 @@ test("gives the selected harness the same governed callback as the framework Bot
     });
     expect(config.services[service].extra_hosts).toContain(
       "host.docker.internal=host-gateway",
+    );
+  }
+});
+
+/**
+ * Rootless Podman on Linux gives `host-gateway` an address that is not this machine's loopback, where
+ * the person's browser and a local Intelligence listen. OpenBot Desktop sets `OPENBOT_HOST_GATEWAY`
+ * there, to the address its Podman configuration maps to loopback, and every service that calls the
+ * host by name takes it.
+ */
+test("sends host.docker.internal where OPENBOT_HOST_GATEWAY says", () => {
+  const config = runComposeConfig({ OPENBOT_HOST_GATEWAY: "10.0.2.2" });
+  for (const service of [
+    "server",
+    "agent-harness",
+    "agent-langgraph",
+  ] as const) {
+    expect(config.services[service].extra_hosts).toContain(
+      "host.docker.internal=10.0.2.2",
     );
   }
 });
@@ -659,13 +710,28 @@ test("gives the server container addresses, not the host's loopback", () => {
     SERVER_PORT: "3001",
     DATABASE_URL: "postgres://openbot:openbot@postgres:5432/openbot",
     AGENT_COMPUTER_URL: "http://agent-computer:4100",
-    COMPUTER_SUPERVISOR_URL: "http://supervisor:4300",
   });
   for (const [name, value] of Object.entries(environment)) {
     expect(`${name}=${value}`).not.toMatch(/localhost|127\.0\.0\.1|\[::1\]/);
   }
   // Production refuses `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS`, which a local OpenBot needs.
   expect(environment.NODE_ENV).toBe("");
+});
+
+/**
+ * The supervisor by name unless the deployment says there is none.
+ *
+ * Unset is every deployment that predates the setting. Set empty is OpenBot Desktop, which runs the
+ * personal edition on one computer, and that edition refuses to start with a supervisor.
+ */
+test("gives the server the supervisor unless the deployment empties it", () => {
+  expect(
+    runComposeConfig({}).services.server?.environment.COMPUTER_SUPERVISOR_URL,
+  ).toBe("http://supervisor:4300");
+  const none = runComposeConfig({ COMPUTER_SUPERVISOR_CONTAINER_URL: "" })
+    .services.server?.environment;
+  expect(none?.COMPUTER_SUPERVISOR_URL ?? "").toBe("");
+  expect(none?.AGENT_COMPUTER_URL).toBe("http://agent-computer:4100");
 });
 
 test("puts the server beside the database and the Bots, and the worker beside the database only", () => {

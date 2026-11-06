@@ -73,6 +73,7 @@ def sdk(monkeypatch, tool_name):
             self.queries = []
             self.results = {}
             self.interrupted = False
+            self.models_set = []
             self.disconnected = False
             self.disconnected_event = asyncio.Event()
             self.hooks_entered = asyncio.Event()
@@ -87,6 +88,10 @@ def sdk(monkeypatch, tool_name):
 
         async def interrupt(self):
             self.interrupted = True
+
+        async def set_model(self, model=None):
+            # `ClaudeSDKClient.set_model`: the running query's next request uses `model`.
+            self.models_set.append(model)
 
         async def query(self, prompt, session_id):
             if not isinstance(prompt, str):
@@ -108,6 +113,8 @@ def sdk(monkeypatch, tool_name):
                 )
                 return
             count = int(prompt) if prompt.isdigit() else 0
+            if self.options.tools == [] and not self.options.allowed_tools:
+                count = 0
             calls = [
                 ToolUseBlock(
                     id=f"{thread}-tool-{i}",
@@ -422,6 +429,31 @@ def test_sdk_authentication_signal_is_typed(sdk, model_only):
             result = await events(adapter, request(tool_count="auth-failed"))
             assert result[-1].type == "RUN_ERROR"
             assert result[-1].code == "OPENBOT_MODEL_AUTH_REQUIRED"
+        finally:
+            await adapter.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_model_last_step_replaces_pending_query_with_tool_free_replay(sdk):
+    async def scenario():
+        adapter = OpenBotClaudeAgentAdapter(name="model", model_only=True)
+        try:
+            first = await events(adapter, request())
+            assert any(event.type == "TOOL_CALL_END" for event in first)
+            final = request(run="final", results=[("thread-a-tool-0", "Collected source")])
+            final.tools = []
+            final.forwarded_props = {"openbotAnswerOnly": True}
+            answer = await events(adapter, final)
+            assert len(sdk) == 2
+            assert sdk[0].interrupted
+            assert sdk[0].disconnected
+            assert sdk[1].options.tools == []
+            assert sdk[1].options.allowed_tools == []
+            assert "Collected source" in str(sdk[1].input_messages)
+            assert any(event.type == "TEXT_MESSAGE_CONTENT" for event in answer)
+            assert not any(event.type == "TOOL_CALL_START" for event in answer)
+            assert answer[-1].type == "RUN_FINISHED"
         finally:
             await adapter.shutdown()
 

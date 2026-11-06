@@ -18,6 +18,7 @@ import {
   userRoles,
   users,
 } from "../db/schema";
+import { currentEdition, PERSONAL_ENTERPRISE_SETTINGS } from "../edition";
 import type { CapabilityRow, Member } from "./capabilities";
 
 export const ENTERPRISE_TOPIC = "enterprise_settings_changed";
@@ -44,6 +45,13 @@ export type EnterpriseSettings = {
    * the most often a Bot checks on its own, so the default only stops Run now pressed all day.
    */
   proactiveDailyRuns: number;
+  /**
+   * People may pick the model a built-in Bot answers on, per conversation (Admin, Models). Off by
+   * default: which model a deployment pays for is the admin's call until they hand it over. Off, the
+   * picker is hidden and every run uses the configured model; picks already saved are kept for when
+   * it is turned back on.
+   */
+  modelSelection: boolean;
 };
 
 export const DEFAULT_ENTERPRISE_SETTINGS: EnterpriseSettings = {
@@ -54,6 +62,7 @@ export const DEFAULT_ENTERPRISE_SETTINGS: EnterpriseSettings = {
   mcpAllowlist: { enabled: false, servers: [] },
   skillSharing: false,
   proactiveDailyRuns: 24,
+  modelSelection: false,
 };
 
 const SETTING_KEYS = {
@@ -64,6 +73,7 @@ const SETTING_KEYS = {
   mcpAllowlist: "mcp_allowlist",
   skillSharing: "skill_sharing",
   proactiveDailyRuns: "proactive_daily_runs",
+  modelSelection: "model_selection",
 } as const satisfies Record<keyof EnterpriseSettings, string>;
 
 export type NetworkPolicyRow = {
@@ -84,6 +94,20 @@ export type ModelUsageSummary = {
   people: number;
   lastUsedAt: string;
 };
+
+/**
+ * Settings this deployment fixes whatever is stored. Set once at startup (`fixSettings`).
+ */
+let fixed: Partial<EnterpriseSettings> = {};
+
+/**
+ * One person on their own machine (`OPENBOT_SINGLE_USER`) is shown every model their credential
+ * lists, so nothing stored, by an earlier team deployment or anybody, narrows it: the model
+ * allowlist is off for them, as it is for the personal edition.
+ */
+export function fixSettings(settings: Partial<EnterpriseSettings>) {
+  fixed = settings;
+}
 
 /** Stored as `{ value }` so every key is a JSON object, which the jsonb column type requires. */
 function unwrap<K extends keyof EnterpriseSettings>(
@@ -127,13 +151,18 @@ async function announce(database: Pick<Database, "execute">) {
 export function createEnterpriseStore(database: Database) {
   return {
     async settings(): Promise<EnterpriseSettings> {
+      // Fixed for the personal edition: a value a team deployment left behind is not read.
+      if (currentEdition() === "personal") return PERSONAL_ENTERPRISE_SETTINGS;
       const rows = await database.select().from(enterpriseSettings);
       const byKey = new Map(rows.map((row) => [row.key, row.value]));
-      return Object.fromEntries(
-        (Object.keys(SETTING_KEYS) as (keyof EnterpriseSettings)[]).map(
-          (key) => [key, unwrap(key, byKey.get(SETTING_KEYS[key]))],
-        ),
-      ) as EnterpriseSettings;
+      return {
+        ...(Object.fromEntries(
+          (Object.keys(SETTING_KEYS) as (keyof EnterpriseSettings)[]).map(
+            (key) => [key, unwrap(key, byKey.get(SETTING_KEYS[key]))],
+          ),
+        ) as EnterpriseSettings),
+        ...fixed,
+      };
     },
 
     async setSetting<K extends keyof EnterpriseSettings>(
@@ -159,6 +188,7 @@ export function createEnterpriseStore(database: Database) {
     },
 
     async capabilityRows(): Promise<CapabilityRow[]> {
+      if (currentEdition() === "personal") return [];
       return database
         .select({
           scopeKind: capabilitySettings.scopeKind,
@@ -269,6 +299,8 @@ export function createEnterpriseStore(database: Database) {
     },
 
     async networkPolicies(): Promise<NetworkPolicyRow[]> {
+      // No screen edits these in the personal edition, so a team deployment's policy is not read.
+      if (currentEdition() === "personal") return [];
       const rows = await database.select().from(networkPolicies);
       return rows.map((row) => ({
         scopeKind: row.scopeKind,
