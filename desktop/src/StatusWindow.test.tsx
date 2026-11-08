@@ -28,11 +28,12 @@ afterEach(() => {
 const running = {
   openbotRunning: true,
   openbotHeld: true,
-  processes: [
-    { name: "server", memoryBytes: 200_000_000 },
-    { name: "app", memoryBytes: 50_000_000 },
+  processes: [],
+  containers: [
+    { name: "openbot-desktop-server-1", memoryBytes: 200_000_000 },
+    { name: "openbot-desktop-worker-1", memoryBytes: 50_000_000 },
+    { name: "openbot-desktop-postgres-1", memoryBytes: 150_000_000 },
   ],
-  containers: [{ name: "openbot-postgres-1", memoryBytes: 150_000_000 }],
   intelligenceStack: "local-abc",
   intelligenceContainers: [
     { name: "k3d-local-abc-server-0", memoryBytes: 2_400_000_000 },
@@ -73,16 +74,27 @@ test("memory reads as people read it, and a total ignores what could not be meas
   expect(totalMemory([{ name: "b", memoryBytes: null }])).toBeNull();
 });
 
-test("each part shows its state and memory, and Intelligence its CLI readiness", async () => {
+test("each part shows its state and memory, and the back end its CLI readiness", async () => {
   invokeHandler = answers();
   const view = render(<StatusWindow readEveryMs={60_000} />);
-  const openbot = await view.findByRole("region", { name: "OpenBot" });
-  expect(openbot.textContent).toContain("Running · 400 MB");
-  expect(openbot.textContent).toContain("openbot-postgres-1");
-  const intelligence = view.getByRole("region", { name: "Intelligence" });
+  const bots = await view.findByRole("region", { name: "App" });
+  expect(bots.textContent).toContain("Running · 400 MB");
+  const intelligence = view.getByRole("region", { name: "Back end" });
   await waitFor(() =>
     expect(intelligence.textContent).toContain("Ready · 2.4 GB"),
   );
+  // Each row says which part of OpenBot it is. Docker's names are for Copy diagnostics only.
+  const rows = (part: HTMLElement) =>
+    [...part.querySelectorAll(".status-list li")].map(
+      (row) => row.firstElementChild?.textContent,
+    );
+  expect(rows(bots)).toEqual([
+    "Front end and Bots",
+    "Background jobs",
+    "Database",
+  ]);
+  expect(rows(intelligence)).toEqual(["Conversations, memory and learning"]);
+  expect(view.container.textContent).not.toMatch(/openbot-desktop-|k3d-/);
   expect(
     invokeCalls.find((call) => call.command === "run_local_eval")?.args,
   ).toMatchObject({ action: "status", stack: "local-abc" });
@@ -92,7 +104,7 @@ test("Restart OpenBot restarts its processes; Stop Intelligence stops only the s
   invokeHandler = answers();
   const view = render(<StatusWindow readEveryMs={60_000} />);
   const intelligence = await view.findByRole("region", {
-    name: "Intelligence",
+    name: "Back end",
   });
   await userEvent.click(
     within(intelligence).getByRole("button", { name: "Stop" }),
@@ -111,13 +123,58 @@ test("Restart OpenBot restarts its processes; Stop Intelligence stops only the s
   ).toBe(false);
 });
 
+test("Open log folder asks the desktop app to open its own log folder", async () => {
+  const logFolder = "/Users/someone/Library/Logs/ai.copilotkit.openbot.desktop";
+  invokeHandler = answers({ desktop_status: { ...running, logFolder } });
+  const view = render(<StatusWindow readEveryMs={60_000} />);
+  await userEvent.click(
+    await view.findByRole("button", { name: "Open log folder" }),
+  );
+  // The window asks; the desktop app opens the folder it writes to, never one it is handed.
+  expect(
+    invokeCalls
+      .filter((call) => call.command === "open_log_folder")
+      .map((call) => call.args === undefined),
+  ).toEqual([true]);
+  expect(
+    view.container.querySelector(".status-details")?.textContent,
+  ).toContain(`Logs${logFolder}`);
+});
+
+test("a log folder that couldn't be opened says where to find it", async () => {
+  invokeHandler = async (command) => {
+    if (command === "open_log_folder") throw "no file manager answered";
+    return answers({
+      desktop_status: {
+        ...running,
+        logFolder: "/Users/someone/Library/Logs/x",
+      },
+    })(command);
+  };
+  const view = render(<StatusWindow readEveryMs={60_000} />);
+  await userEvent.click(
+    await view.findByRole("button", { name: "Open log folder" }),
+  );
+  await view.findByText(
+    "Couldn't open the log folder. Find it under Logs below.",
+  );
+});
+
+test("a desktop app without a log offers no Open log folder", async () => {
+  invokeHandler = answers();
+  const view = render(<StatusWindow readEveryMs={60_000} />);
+  await view.findByRole("region", { name: "App" });
+  expect(view.queryByRole("button", { name: "Open log folder" })).toBeNull();
+});
+
 test("diagnostics carry versions, places and memory, and nothing secret", () => {
   const text = diagnostics(running, "ready");
   expect(text).toContain("OpenBot Desktop 0.2.0");
   expect(text).toContain(
     "Installed in /Users/someone/OpenBot, app on port 3010",
   );
-  expect(text).toContain("Intelligence: local-abc, ready");
+  expect(text).toContain("Back end: local-abc, ready");
   expect(text).toContain("k3d-local-abc-server-0 2.4 GB");
+  expect(text).toContain("openbot-desktop-postgres-1 150 MB");
   expect(text).not.toMatch(/key|token|secret/i);
 });

@@ -20,6 +20,7 @@ import {
   skillSharingAllowed,
   skillSharingInSnapshot,
 } from "./admin/controls";
+import { fixSettings } from "./admin/settings-store";
 import {
   CoworkerUnavailableError,
   createActorAgentResolver,
@@ -171,7 +172,6 @@ import { createDeliveryStore } from "./delivery/store";
 import type { DeliveryScope } from "./delivery/types";
 import { DeliveryRefusedError } from "./delivery/types";
 import { setEdition } from "./edition";
-import { fixSettings } from "./admin/settings-store";
 import {
   createHostAccessBroker,
   HostAccessRefusedError,
@@ -250,6 +250,7 @@ import {
   selectProviderWiring,
   storedProvider,
 } from "./plugins/provider-wiring";
+import { startBrokeredRelist } from "./plugins/relist";
 import {
   createSharedUseGate,
   createSharedUseStore,
@@ -280,6 +281,10 @@ import { createRecorderExtension } from "./recorder/wiring";
 import { createRequestActor } from "./request-actor";
 import { createResponsibilityBindingStore } from "./responsibilities/bindings";
 import {
+  useGoalTools,
+  withoutGoalCopiesInGoalRun,
+} from "./responsibilities/chat-tools";
+import {
   createEmailTriggerRoutes,
   createSnsVerifier,
   fetchText as fetchSnsText,
@@ -301,7 +306,11 @@ import { createServerResponsibilityEngine } from "./responsibilities/wiring";
 import { createRoutineRunner } from "./routines/runner";
 import { createRoutineStore } from "./routines/store";
 import { createIntentRouter } from "./routing/classify";
-import { createModelCompleter, routingModelFor } from "./routing/model";
+import {
+  createModelCompleter,
+  createSkillChooser,
+  routingModelFor,
+} from "./routing/model";
 import { createSelfHostBanner } from "./self-host-banner";
 import { createSetupSources, modelKeyOf } from "./setup/checklist";
 import { createComputerCheck } from "./setup/computer-check";
@@ -316,6 +325,7 @@ import {
 } from "./telemetry/product-boundaries";
 import {
   createPackageStatusReader,
+  deploymentNameOf,
   loadTenantPackage,
   synchronizeTenantPackage,
 } from "./tenant-package";
@@ -449,9 +459,11 @@ const agentProfileStore = createAgentProfileStore(
 // Read here rather than beside the synchronise below, because the package names the deployment and
 // the channel store needs that name before it can mint a thread id.
 const tenantPackage = await loadTenantPackage(config.tenantPackageDirectory);
-const threadIdentity = createThreadIdentity(
-  config.deploymentId ?? tenantPackage.tenantId,
-);
+// The package's id unless DEPLOYMENT_ID says otherwise, and the id the deployment was set up under if
+// the package has since been renamed. See `deploymentNameOf`.
+const deploymentId =
+  config.deploymentId ?? (await deploymentNameOf(database, tenantPackage));
+const threadIdentity = createThreadIdentity(deploymentId);
 const baseChannelStore = createChannelStore(
   database,
   agentProfileStore,
@@ -594,7 +606,7 @@ const { resolveRequestActor, identifyUser, identifyActor } = createRequestActor(
   },
 );
 // Where a person's own OpenBot browser may go: not where Bots may, but where their browser on their own laptop would
-// (browser/egress.ts). On OpenBot Desktop's host-side computer that is their own desktop, so everywhere.
+// (browser/egress.ts). On a host-side computer of people's browsers that is their own desktop, so everywhere.
 const personBrowserPolicy = personBrowserEgressPolicy({
   native: config.browser !== undefined,
   allowPrivateHosts: config.computer?.allowPrivateHosts ?? false,
@@ -609,6 +621,7 @@ const computerProvider = config.computer
       withPersonBrowsers(
         createComputerProvider(config.computer),
         config.browser?.url,
+        config.edition,
       ),
       {
         policyForBot: (botId) =>
@@ -771,22 +784,34 @@ if (chooseOpenAIApi(runtimeModel) === "responses")
     }),
   );
 
+/** The deployment's own model key, resolved on every call so a rotated one is used by the next. */
+const resolveDeploymentModelKey = () =>
+  resolveModelApiKey({
+    encryptionKey: config.keyEncryptionKey,
+    reader: credentialStore,
+    provider: runtimeModel.provider,
+    keyId: tenantPackage.model.credentialSecretRef,
+    environment: process.env,
+  });
+
 /**
- * Pass one of tool selection: which skills a message needs, on the deployment's own model.
- *
- * Built once rather than per request, because it holds nothing about a person: the key is resolved
- * on every call, so a credential rotated a moment ago is used by the next run.
+ * Pass one of tool selection, on the model the built-in Bots run on: their key, or their plan's
+ * harness. See `createSkillChooser`. Built once rather than per request, because it holds nothing
+ * about a person.
  */
-const chooseSkills = createModelCompleter({
+const chooseSkills = createSkillChooser(
+  runtimeModel,
+  resolveDeploymentModelKey,
+);
+
+/**
+ * The approval reviewer's model: the deployment's own, with its key or on its plan's harness (see
+ * `createModelCompleter`). On a plan it threw on every call and failed closed, so Auto-review asked
+ * the person about everything. It still fails closed on an error or a timeout (`reviewAction`).
+ */
+const reviewActions = createModelCompleter({
   model: runtimeModel,
-  resolveApiKey: () =>
-    resolveModelApiKey({
-      encryptionKey: config.keyEncryptionKey,
-      reader: credentialStore,
-      provider: runtimeModel.provider,
-      keyId: tenantPackage.model.credentialSecretRef,
-      environment: process.env,
-    }),
+  resolveApiKey: resolveDeploymentModelKey,
 });
 
 /*
@@ -842,7 +867,7 @@ const approvalService = createServerApprovalService({
   authoriseQuestion,
   routineIntelligence,
   approvalComputerTools,
-  review: (prompt, signal) => chooseSkills(prompt, signal),
+  review: (prompt, signal) => reviewActions(prompt, signal),
   // Assigned further down, once delivery is wired.
   notify: (scope, input) => deliveryNotifications(scope, input),
 });
@@ -1080,7 +1105,7 @@ await ensureSingleUserIdentity(database, {
 const pluginStore = withPersonalDefaults(
   createPluginStore({
     database,
-    deploymentId: config.deploymentId ?? tenantPackage.tenantId,
+    deploymentId,
     auditStore: bootAuditStore,
     credentials: credentialStore,
     encryptionKey: config.keyEncryptionKey,
@@ -1125,7 +1150,7 @@ const accountModes = createAccountModeSwitch({
   store: pluginStore,
   sharedUse: sharedUseStore,
   teamRules: approvalService.store.policy,
-  deploymentId: config.deploymentId ?? tenantPackage.tenantId,
+  deploymentId,
   audit: bootAuditStore,
 });
 
@@ -1178,6 +1203,12 @@ startPersonalDefaultApps(
   personalDefaultsDeps(database),
   personalDefaultAppsMemory(database),
 );
+/*
+ * An app of the broker listed by an older build is listed again once, so an upgraded install records
+ * its actions as a fresh one would (see `relistOutdatedBrokeredApps`). Not awaited, for the reason
+ * above, and it keeps trying until every app is listed.
+ */
+startBrokeredRelist(pluginStore);
 const responsibilityStore = createResponsibilityStore(database, {
   resolveTarget: async (ownerUserId, agentId, channelId) => {
     const actor = await actorFor(ownerUserId);
@@ -1257,6 +1288,13 @@ useTriggerTools({
   responsibilities: responsibilityStore,
   publicUrl: config.publicUrl ?? null,
   emailDomain: inboundEmail?.domain ?? null,
+});
+// And goals, through the same transport: asked for a goal, a Bot makes one. See chat-tools.ts.
+useGoalTools({
+  store: responsibilityStore,
+  // Read when a goal is run, long after the engine further down is made.
+  engine: { ingest: (event) => responsibilityEngine.ingest(event) },
+  conversationFor: routineStore.conversationFor,
 });
 
 /**
@@ -1848,6 +1886,8 @@ const selectionForActor = (actorId: string): ToolSelection => ({
         granted: selection.granted,
         offered: selection.offered.length,
         skills: selection.skills,
+        // Set when the offer was cut to what one request may carry. See `fitToolLimit`.
+        ...(selection.limit === undefined ? {} : { limit: selection.limit }),
       },
     });
   },
@@ -1867,6 +1907,10 @@ const agentFetch = createAgentFetch({
     config.managedAgent?.endpoint,
     config.managedAgent?.alsoRun,
   ].filter((url): url is URL => url !== undefined),
+  // An agent the person runs on their own loopback, reached from this server's container.
+  ...(config.thisMachineHost
+    ? { thisMachineHost: config.thisMachineHost }
+    : {}),
   // The refusal is what the run already knows; this is what the deployment knows. Written here
   // rather than in `endpoint.ts` so that file keeps deciding and nothing else, the way the
   // target check it reuses does.
@@ -2042,7 +2086,11 @@ const actorAgentResolver = createActorAgentResolver({
     restrictToolsForRun(
       initiator,
       actorId,
-      loadToolsForActor(actorId, initiator),
+      // A goal's run holds the goal's own tools; the Routines copies would be a second set.
+      withoutGoalCopiesInGoalRun(
+        initiator,
+        loadToolsForActor(actorId, initiator),
+      ),
       checkInScope,
     ),
   signRunForActor,
@@ -2179,7 +2227,8 @@ const responsibilitySweep = repeatAfterEach(async () => {
     if (
       report.succeeded.length ||
       report.failed.length ||
-      report.waiting.length
+      report.waiting.length ||
+      report.busy.length
     )
       console.info(
         JSON.stringify({ type: "responsibility-dispatch", ...report }),
@@ -2699,6 +2748,7 @@ const channelSummaries = {
   title: createChannelTitler({
     provider: runtimeModel.provider,
     model: runtimeModel.defaultModel,
+    ...(runtimeModel.plan ? { plan: runtimeModel.plan } : {}),
     resolveApiKey: resolveRuntimeModelApiKey,
   }),
   owner: workOwner("summariser"),
@@ -2963,15 +3013,16 @@ const app = createApp(
           },
         }
       : {}),
-    // Only where a person's browser can run: OpenBot Desktop's host-side computer, or computers Bots run on that give
-    // each its own. Where every Bot shares one, the routes have no computers and say why (browser/host.ts).
+    // Only where a person's browser can run: a host-side computer of people's browsers, computers Bots run on that give
+    // each its own, or the personal edition's one computer. Where every Bot shares one, the routes have no computers and
+    // say why (browser/host.ts).
     ...(computerGateway || config.browser
       ? {
           browser: {
             ...personBrowserPlace({
               provider: computerProvider,
               browserUrl: config.browser?.url,
-              ...(config.browserAbsent ? { absent: config.browserAbsent } : {}),
+              edition: config.edition,
               computers: () =>
                 computerGateway
                   ? gatewayBrowserComputers(

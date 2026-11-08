@@ -1,6 +1,7 @@
 import { Hono, type MiddlewareHandler } from "hono";
 import type { AppVariables } from "../auth/guards";
 import type { DeploymentConfig } from "../config";
+import type { Edition } from "../edition";
 import type { CredentialStatusReader } from "../credentials";
 import { entitlementWarning } from "../intelligence-entitlement-check";
 import type { ModelCheckOutcome } from "../model-availability-check";
@@ -165,7 +166,12 @@ const MEMBER_NOT_CHECKED = "It's set up but hasn't been checked yet.";
 /** The rows for one reader. Pure, so every branch can be pinned without a server. */
 export function setupRows(
   facts: SetupFacts,
-  options: { productName: string; audience: "admin" | "member" },
+  options: {
+    productName: string;
+    audience: "admin" | "member";
+    /** The personal edition has no Slack and Teams row. Absent, a team deployment's rows. */
+    edition?: Edition;
+  },
 ): SetupRow[] {
   const { productName: product, audience } = options;
   const admin = audience === "admin";
@@ -202,10 +208,10 @@ export function setupRows(
 
   const broker = BROKER[facts.apps.provider];
 
-  return [
+  const rows = [
     deployment({
       id: "intelligence",
-      title: "CopilotKit Intelligence",
+      title: "Back end",
       required: true,
       ...intelligenceRow(facts.intelligence, product),
     }),
@@ -248,6 +254,15 @@ export function setupRows(
       },
     }),
   ];
+  /*
+   * NO SLACK AND TEAMS ROW ON THE PERSONAL EDITION. Its one person installed OpenBot Desktop and
+   * has no server environment to set variables in, so "Set OPENTAG_SHARED_SECRET and OPENTAG_URL,
+   * then restart" was an instruction nobody there can follow, and it kept "1 needs setup" in the
+   * Settings sidebar for good. A team deployment's admin still gets the row.
+   */
+  return options.edition === "personal"
+    ? rows.filter((row) => row.id !== "chat")
+    : rows;
 }
 
 const INTELLIGENCE_VARIABLES = [
@@ -280,7 +295,7 @@ function intelligenceRow(fact: IntelligenceFact, product: string) {
   return {
     status: "needs_setup" as const,
     readyDetail,
-    gapDetail: `${product} couldn't reach Intelligence. Check its address and key.`,
+    gapDetail: `${product} couldn't reach its back end. Check its address and key.`,
     fix: {
       kind: "env" as const,
       names: INTELLIGENCE_VARIABLES,
@@ -398,15 +413,15 @@ export function entitlementAdvice(warning: {
 }): string {
   switch (warning.code) {
     case "RUNTIME_ENTITLEMENTS_SELF_HOSTED_MISCONFIGURED":
-      return "Intelligence has no valid licence. Set COPILOTKIT_LICENSE_TOKEN on Intelligence's own deployment.";
+      return "The back end has no valid licence. Set COPILOTKIT_LICENSE_TOKEN on the back end's own deployment.";
     case "RUNTIME_ENTITLEMENTS_SELF_HOSTED_EXPIRED":
-      return "Intelligence's licence has expired. Renew it and replace COPILOTKIT_LICENSE_TOKEN on Intelligence's deployment.";
+      return "The back end's licence has expired. Renew it and replace COPILOTKIT_LICENSE_TOKEN on the back end's deployment.";
     case "RUNTIME_ENTITLEMENTS_MANAGED_UNAVAILABLE":
-      return "Intelligence couldn't confirm this project's licence. Check again in a few minutes.";
+      return "The back end couldn't confirm this project's licence. Check again in a few minutes.";
   }
   if (warning.status === "inactive")
-    return "Intelligence says this deployment's licence isn't active. Memory stays off until it is.";
-  return "Intelligence didn't confirm this deployment's licence. Check again in a few minutes.";
+    return "The back end says this deployment's licence isn't active. Memory stays off until it is.";
+  return "The back end didn't confirm this deployment's licence. Check again in a few minutes.";
 }
 
 /**
@@ -469,6 +484,8 @@ export async function modelKeyOf(input: {
 /** What the route needs: the product's name, the facts, and a way to ask again. */
 export type SetupSources = {
   productName: string;
+  /** Which product this is: the personal edition leaves out rows its one person cannot act on. */
+  edition?: Edition;
   /** A local install for one person, whose only reader is the person running it. */
   localEvaluation: boolean;
   /**
@@ -488,7 +505,7 @@ function withinTime<T>(promise: Promise<T>, ms: number): Promise<T | Error> {
     ),
     new Promise<Error>((resolve) => {
       const timer = setTimeout(
-        () => resolve(new Error("Intelligence did not answer.")),
+        () => resolve(new Error("No answer in time.")),
         ms,
       );
       timer.unref?.();
@@ -510,7 +527,7 @@ function withinTime<T>(promise: Promise<T>, ms: number): Promise<T | Error> {
  */
 export function createSetupSources(input: {
   productName: string;
-  config: Pick<DeploymentConfig, "singleUser">;
+  config: Pick<DeploymentConfig, "singleUser" | "edition">;
   environment: Record<string, string | undefined>;
   model: {
     provider: "openai" | "anthropic";
@@ -607,6 +624,7 @@ export function createSetupSources(input: {
 
   return {
     productName: input.productName,
+    edition: input.config.edition,
     localEvaluation: input.config.singleUser,
     facts: async () => {
       const round = kept;
@@ -692,7 +710,11 @@ export function createSetupRoutes(
     return context.json({
       checklist: {
         audience,
-        rows: setupRows(facts, { productName: sources.productName, audience }),
+        rows: setupRows(facts, {
+          productName: sources.productName,
+          audience,
+          ...(sources.edition ? { edition: sources.edition } : {}),
+        }),
       },
     });
   };

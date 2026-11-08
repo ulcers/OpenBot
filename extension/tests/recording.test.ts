@@ -914,6 +914,52 @@ test("a tab whose url Chrome withholds (a chrome:// page) starts with the networ
   });
 });
 
+test("a page the Record tab reaches while Record starts is its first step, and the next page change comes from it", async () => {
+  // A new browser's blank tab, whose address Chrome withholds, as OpenBot's own browser opens on.
+  fake.tabs.set(7, { id: 7 } as chrome.tabs.Tab);
+  const opening = hold("document");
+  const answer = page({ type: "page.record", title: "T", tabId: 7 });
+  await until(opening.hit, "Record waiting on the document");
+  expect((await state()).phase).toBe("starting");
+  // The person types an address into OpenBot's address bar while Record still starts: the tab commits it.
+  fake.tabs.set(7, { id: 7, url: DEAL } as chrome.tabs.Tab);
+  fake.webNavigation.commit({
+    tabId: 7,
+    frameId: 0,
+    url: DEAL,
+    transitionType: "typed",
+  });
+  await settle();
+  opening.open();
+  expect(await answer).toEqual({ ok: true });
+  // The network capture and the script start on the page the tab is on now, not the blank one Record first read.
+  expect(network.calls).toEqual([`start 7 ${DEAL}`]);
+  fake.webNavigation.commit({
+    tabId: 7,
+    frameId: 0,
+    url: "https://crm.example.test/deals/43",
+    transitionType: "typed",
+  });
+  // The person moves to another tab: the pages they visited in this one go out.
+  fake.person.openTab();
+  const navigations = () =>
+    sentToDocument("offscreen.event")
+      .map((m) => (m.type === "offscreen.event" ? m.event : null))
+      .filter((recorded) => recorded?.name === "navigation");
+  await until(() => navigations().length === 2, "both page changes");
+  await settle();
+  expect(navigations().map((recorded) => recorded?.value)).toMatchObject([
+    { step: "navigate", from: "", to: DEAL, transitionType: "typed" },
+    {
+      step: "navigate",
+      from: DEAL,
+      to: "https://crm.example.test/deals/43",
+      transitionType: "typed",
+    },
+  ]);
+  expect(await state()).toMatchObject({ actions: 2 });
+});
+
 test("a failure once the document started rolls everything back, and the document clears what it holds", async () => {
   network.failStart = true;
   fake.tabs.set(7, { id: 7, url: DEAL } as chrome.tabs.Tab);
@@ -999,7 +1045,7 @@ test("Stop queues the outcome in the document, and the recording waits as a drai
 test("a recording the document could not send at all never reads as sent: Stop says nothing reached Intelligence", async () => {
   const id = await record();
   const NOT_SENT =
-    "Nothing of this recording reached Intelligence: the Recorder could not start sending it. Try recording again.";
+    "Nothing of this recording reached OpenBot's back end: the Recorder could not start sending it. Try recording again.";
   holdStop = true;
   const stopping = page({ type: "page.stop" });
   await until(
@@ -1647,7 +1693,7 @@ test("Start over on the notice records a new recording whose count starts again"
 
 // ---- Start over ------------------------------------------------------------------------------
 
-test("Start over sends the recording it leaves to Intelligence with a failed outcome and records into a new trajectory", async () => {
+test("Start over sends the recording it leaves to OpenBot's back end with a failed outcome and records into a new trajectory", async () => {
   const old = await record();
   const oldTrajectory = trajectoryOf(old);
   const content = contentPort(7);
@@ -1773,7 +1819,7 @@ test("once Intelligence takes events again the popup says Streaming, and nothing
   const id = await record();
   const trajectory = trajectoryOf(id);
   const busy =
-    "Intelligence is busy or unreachable. Retrying; nothing is lost.";
+    "OpenBot's back end is busy or unreachable. Retrying; nothing is lost.";
   doc?.postMessage({
     type: "offscreen.status",
     capture: {

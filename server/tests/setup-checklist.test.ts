@@ -239,7 +239,7 @@ describe("setup rows", () => {
       fix: null,
     });
     expect(row(admin, "intelligence").detail).toBe(
-      "Intelligence has no valid licence. Set COPILOTKIT_LICENSE_TOKEN on Intelligence's own deployment.",
+      "The back end has no valid licence. Set COPILOTKIT_LICENSE_TOKEN on the back end's own deployment.",
     );
     // The boot log's Helm keys stay in the log.
     expect(row(admin, "intelligence").detail).not.toContain("appApi");
@@ -259,7 +259,7 @@ describe("setup rows", () => {
     );
     expect(row(rows, "intelligence")).toMatchObject({
       status: "needs_setup",
-      detail: "OpenBot couldn't reach Intelligence. Check its address and key.",
+      detail: "OpenBot couldn't reach its back end. Check its address and key.",
       fix: {
         kind: "env",
         names: [
@@ -1340,4 +1340,61 @@ test("a computer list that never answers holds back the next check for a minute,
   } finally {
     jest.useRealTimers();
   }
+});
+
+/** OpenBot Desktop's configuration: the personal edition, one person, nobody signing in. */
+const PERSONAL = {
+  GOOGLE_OAUTH_CLIENT_ID: undefined,
+  GOOGLE_OAUTH_CLIENT_SECRET: undefined,
+  BETTER_AUTH_SECRET: undefined,
+  BETTER_AUTH_URL: undefined,
+  INITIAL_ADMIN_EMAILS: undefined,
+  OPENBOT_EDITION: "personal",
+  OPENBOT_SINGLE_USER: "true",
+  AGENT_COMPUTER_URL: "http://127.0.0.1:7000",
+  OPENAI_API_KEY: "sk-set",
+};
+
+describe("Slack and Teams on the personal edition", () => {
+  /*
+   * On the Mac, Settings › Setup in OpenBot Desktop said "Slack and Teams: Needs setup. Set
+   * OPENTAG_SHARED_SECRET and OPENTAG_URL, then restart OpenBot", which nobody running the Desktop
+   * app can do, and the sidebar counted it as "1 needs setup" for good.
+   */
+  test("the personal edition has no Slack and Teams row, and nothing names its variables", async () => {
+    const { checklist, text } = await checklistFrom(
+      appWith({
+        who: "admin",
+        environment: PERSONAL,
+        modelCheckAtBoot: { kind: "available" },
+        computer: true,
+        apps: true,
+        chat: false,
+      }),
+    );
+    expect(checklist.rows.map((row) => row.id)).not.toContain("chat");
+    expect(text).not.toContain("OPENTAG");
+    expect(
+      checklist.rows.filter((row) => row.status === "needs_setup"),
+    ).toEqual([]);
+  });
+
+  test("a team deployment's admin still gets the row and how to set it up", async () => {
+    const { checklist } = await checklistFrom(
+      appWith({
+        who: "admin",
+        environment: { OPENAI_API_KEY: "sk-set" },
+        modelCheckAtBoot: { kind: "available" },
+        computer: true,
+        apps: true,
+        chat: false,
+      }),
+    );
+    const chat = checklist.rows.find((row) => row.id === "chat");
+    expect(chat?.status).toBe("needs_setup");
+    expect(chat?.fix).toMatchObject({
+      kind: "env",
+      names: ["OPENTAG_SHARED_SECRET", "OPENTAG_URL"],
+    });
+  });
 });

@@ -32,6 +32,11 @@ export type DesktopStatus = {
   appPort: number | null;
   version: string;
   build: string;
+  /**
+   * The folder the desktop app writes its log file to. Absent from a desktop app older than the
+   * log, which has no Open log folder to offer.
+   */
+  logFolder?: string | null;
 };
 
 /** The Intelligence CLI's own end-to-end readiness. */
@@ -42,10 +47,45 @@ export type IntelligenceReadiness =
   | "degraded"
   | "unknown";
 
+/**
+ * A newer OpenBot Desktop, as the desktop app last read it from its update feed. The app reads the
+ * feed itself, at launch and every six hours; this page only asks the app, so a browser showing a
+ * self-hosted OpenBot (no desktop app around it) never asks anybody.
+ */
+export type DesktopAppUpdate = {
+  /** The version to offer; null when there is none, or this person closed the banner on it. */
+  version: string | null;
+  /** The desktop app's own version. */
+  current: string;
+  /** Set from the click on Update and restart until the app restarts. */
+  installing: {
+    downloaded: number;
+    total: number | null;
+    restarting: boolean;
+  } | null;
+  /**
+   * False on a build that never updates itself: an internal or candidate build, or one without the
+   * updater. Absent from a desktop app older than the field, which still answers a check.
+   */
+  updatesItself?: boolean;
+};
+
+/**
+ * What the desktop app found when asked to check for updates now: it reads its update feed at once.
+ * A newer version is named even if this person closed the banner on it, because they asked.
+ */
+export type DesktopAppUpdateCheck =
+  | { found: "available"; version: string; current: string }
+  | { found: "upToDate"; current: string }
+  | { found: "installing"; version: string; current: string }
+  /** This build never updates itself: an internal or candidate build. */
+  | { found: "notOffered"; current: string };
+
 export const desktopKeys = {
   all: ["desktop"] as const,
   status: (memory: boolean) => ["desktop", "status", { memory }] as const,
   intelligence: ["desktop", "intelligence"] as const,
+  appUpdate: ["desktop", "app-update"] as const,
 };
 
 const PLUGIN = "plugin:openbot-desktop";
@@ -93,6 +133,22 @@ export function intelligenceReadinessQueryOptions() {
   });
 }
 
+/**
+ * The update banner's offer. Asked only inside the Desktop window; anywhere else it is never asked.
+ * A read of the app's memory, so asking every minute costs nothing, and twice a second while an
+ * update downloads, for its progress. An older desktop app has no such command and refuses it the
+ * same way every time, so a refusal is not retried: there is just no banner.
+ */
+export function desktopAppUpdateQueryOptions() {
+  return queryOptions({
+    queryKey: desktopKeys.appUpdate,
+    queryFn: (): Promise<DesktopAppUpdate> => invokeDesktop("update_offer"),
+    enabled: desktopShell() !== null,
+    retry: false,
+    refetchInterval: (query) => (query.state.data?.installing ? 500 : 60_000),
+  });
+}
+
 /** "1.2 GB", "340 MB": decimal, as macOS reports memory. */
 export function formatBytes(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -129,8 +185,8 @@ export function diagnostics(
     `  processes: ${parts(status.processes)}`,
     `  containers: ${parts(status.containers)}`,
     status.intelligenceStack
-      ? `Intelligence: ${status.intelligenceStack}, ${readiness ?? "not checked"}`
-      : "Intelligence: no local stack",
+      ? `Back end: ${status.intelligenceStack}, ${readiness ?? "not checked"}`
+      : "Back end: not on this computer",
     ...(status.intelligenceStack
       ? [`  containers: ${parts(status.intelligenceContainers)}`]
       : []),
